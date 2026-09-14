@@ -4,7 +4,7 @@
 //
 //  修复项:
 //  1. UI 控制页面无法打开 —— 精简版 VCamFloatingBall 未给 tabControlBtn 绑定
-//     "显示控制页/隐藏动作页"的 target, 面板卡在动作页。本补丁用 runtime 给
+//     "显示控制页/隐藏动作页" 的 target, 面板卡在动作页。本补丁用 runtime 给
 //     tabControlBtn 追加 TouchUpInside target, 并在动作页底部补一个"返回控制"按钮。
 //
 //  2. 核心逻辑替换失败 —— 精简版 VCamCore 保留了 _licGate / _licMark 门禁
