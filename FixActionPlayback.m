@@ -344,10 +344,10 @@ static void fx_resetReaderForLoop(id self, SEL _cmd) {
 }
 
 // ============================================================
-//  取 player（通过混淆类名 Qz1）
+//  取 player（兼容混淆名 Qz1 与未混淆名 VCamCore）
 // ============================================================
 static id fxPlayer(void) {
-    Class c = NSClassFromString(@"Qz1");
+    Class c = NSClassFromString(@"Qz1") ?: NSClassFromString(@"VCamCore");
     if (!c) return nil;
     SEL s = NSSelectorFromString(@"sharedInstance");
     if (![c respondsToSelector:s]) return nil;
@@ -731,7 +731,7 @@ static void fxInstall(void) {
                 fxLog(@"hook startReading OK");
             }
 
-            Class lp = NSClassFromString(@"Wv2");
+            Class lp = NSClassFromString(@"Wv2") ?: NSClassFromString(@"LocalVideoPlayer");
             if (lp) {
                 SEL sReset = NSSelectorFromString(@"resetReaderForLoop");
                 Method m2 = class_getInstanceMethod(lp, sReset);
