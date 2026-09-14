@@ -1,6 +1,9 @@
 //
 //  VCamFloatingBall.m
-//  悬浮球 + 控制面板（选择视频/播/替/转/镜/箭头/缩放/复位）
+//  悬浮球 + 控制面板
+//  功能: 选择视频 / 禁用视频 / 旋转 / 放大 / 缩小
+//        + 动作面板(VCamActionPatch 注入 tab)
+//        + 隐藏悬浮球(VCamHidePatch 注入按钮)
 //
 
 #import "VCamFloatingBall.h"
@@ -60,7 +63,6 @@ static void vcam_ball_log(NSString *msg) {
         self.layer.borderWidth = 2;
         self.layer.borderColor = [UIColor colorWithRed:0.75 green:0.76 blue:0.78 alpha:1.0].CGColor;
 
-        // SF Symbol 图标（替代加密的 ball_icon.h）
         UIImageSymbolConfiguration *cfg =
             [UIImageSymbolConfiguration configurationWithPointSize:26
                                                             weight:UIImageSymbolWeightSemibold];
@@ -86,15 +88,21 @@ static void vcam_ball_log(NSString *msg) {
 //  VCamFloatingBall
 // ============================================================
 @interface VCamFloatingBall () <PHPickerViewControllerDelegate>
+
 @property (nonatomic, strong) UIWindow *overlayWindow;
 @property (nonatomic, strong) VCamBallView *ballView;
 @property (nonatomic, strong) UIView *panelView;
+
+// tab 行（VCamActionPatch 会 KVC 找 tabControlBtn / controlPageView 注入"动作"页）
+@property (nonatomic, strong) UIButton *tabControlBtn;
+@property (nonatomic, strong) UIView *controlPageView;
+
+// 替换按钮引用（用于刷新标题/边框）
 @property (nonatomic, strong) VCamPanelButton *replaceBtn;
-@property (nonatomic, strong) VCamPanelButton *mirrorBtn;
-@property (nonatomic, strong) VCamPanelButton *playPauseBtn;
+
 @property (nonatomic, assign) BOOL panelVisible;
 @property (nonatomic, assign) BOOL isFloating;
-@property (nonatomic, assign) BOOL isPaused;
+
 @end
 
 @implementation VCamFloatingBall
@@ -113,10 +121,11 @@ static void vcam_ball_log(NSString *msg) {
     if (self) {
         _panelVisible = NO;
         _isFloating = NO;
-        _isPaused = NO;
     }
     return self;
 }
+
+#pragma mark - 显示/隐藏
 
 - (void)showFloatingBall {
     if (_isFloating) return;
@@ -185,6 +194,7 @@ static void vcam_ball_log(NSString *msg) {
     UIPanGestureRecognizer *panGesture =
         [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(ballDragged:)];
     [_ballView addGestureRecognizer:panGesture];
+
     [self createPanel];
     [_overlayWindow addSubview:_ballView];
 }
@@ -230,19 +240,16 @@ static void vcam_ball_log(NSString *msg) {
 - (void)createPanel {
     CGFloat panelW = 241;
     CGFloat pad = 10;
-    CGFloat contentW = panelW - pad * 2;
-    CGFloat rowH = 38;
+    CGFloat contentW = panelW - pad * 2;    // 221
+    CGFloat tabH = 30;
+    CGFloat rowH = 38;                       // 整宽按钮高度
+    CGFloat cellH = 52;                      // 双列按钮高度
     CGFloat gap = 8;
 
-    CGFloat cellW = 50;
-    CGFloat cellH = 44;
-    CGFloat gridGap = 7;
-    CGFloat gridW = cellW * 3 + gridGap * 2;
-    CGFloat gridX = (panelW - gridW) / 2;
-    CGFloat gridY = rowH + gap;
-    CGFloat gridH = cellH * 4 + gridGap * 3;
-    CGFloat controlH = rowH + gap + gridH;
-    CGFloat panelH = pad + controlH + pad;
+    // 控制页内容高度: 选择视频 + [禁用|旋转] + [−|+]
+    CGFloat controlH = rowH + gap + cellH + gap + cellH;
+    CGFloat pageTop = pad + tabH + 6;
+    CGFloat panelH = pageTop + controlH + pad;
 
     _panelView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, panelW, panelH)];
     _panelView.backgroundColor = [self vcPanelBgColor];
@@ -251,95 +258,74 @@ static void vcam_ball_log(NSString *msg) {
     _panelView.alpha = 0;
     _panelView.hidden = YES;
 
-    // 选择视频按钮
+    // ===== tab 行: 控制(动作 tab 由 VCamActionPatch 注入到右侧) =====
+    CGFloat tabW = 64;
+    _tabControlBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    _tabControlBtn.frame = CGRectMake(pad, pad, tabW, tabH);
+    [_tabControlBtn setTitle:@"控制" forState:UIControlStateNormal];
+    _tabControlBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    _tabControlBtn.layer.cornerRadius = 7;
+    _tabControlBtn.backgroundColor = [UIColor colorWithRed:0.58 green:0.59 blue:0.61 alpha:1.0];
+    [_tabControlBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [_panelView addSubview:_tabControlBtn];
+
+    // ===== 控制页 =====
+    _controlPageView = [[UIView alloc] initWithFrame:CGRectMake(0, pageTop, panelW, controlH)];
+    _controlPageView.backgroundColor = [UIColor clearColor];
+    [_panelView addSubview:_controlPageView];
+
+    // 行 1: 选择视频(整宽)
     VCamPanelButton *selectBtn = [self makeButton:@"选择视频"
-                                            frame:CGRectMake(pad, pad, contentW, rowH)
+                                            frame:CGRectMake(pad, 0, contentW, rowH)
                                           selector:@selector(selectVideoTapped)];
     selectBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    [_panelView addSubview:selectBtn];
+    [_controlPageView addSubview:selectBtn];
 
-    // 3x4 宫格
-    typedef NS_ENUM(int, GridCellType) {
-        CellEmpty,
-        CellSymbol,
-    };
-    struct GridCell {
-        GridCellType type;
-        NSString *symbol;
-        SEL action;
-    };
-    struct GridCell cells[4][3] = {
-        { {CellSymbol, @"arrow.uturn.backward", @selector(resetTransformTapped)},
-          {CellSymbol, @"arrow.up", @selector(panUpTapped)},
-          {CellSymbol, @"rectangle.on.rectangle", @selector(mirrorTapped)} },
-        { {CellSymbol, @"arrow.left", @selector(panLeftTapped)},
-          {CellSymbol, @"arrow.down", @selector(panDownTapped)},
-          {CellSymbol, @"arrow.right", @selector(panRightTapped)} },
-        { {CellSymbol, @"minus", @selector(zoomOutTapped)},
-          {CellSymbol, @"play.fill", @selector(playPauseTapped)},
-          {CellSymbol, @"plus", @selector(zoomInTapped)} },
-        { {CellSymbol, @"rotate.right", @selector(rotateRightTapped)},
-          {CellSymbol, @"arrow.2.squarepath", @selector(toggleReplacementTapped)},
-          {CellEmpty, nil, NULL} },
-    };
+    // 行 2: [禁用视频] [旋转]
+    CGFloat colGap = 8;
+    CGFloat colW = (contentW - colGap) / 2.0;
+    CGFloat row2Y = rowH + gap;
 
-    for (int r = 0; r < 4; r++) {
-        for (int c = 0; c < 3; c++) {
-            struct GridCell cell = cells[r][c];
-            if (cell.type == CellEmpty) continue;
-            CGRect f = CGRectMake(gridX + c * (cellW + gridGap),
-                                  pad + gridY + r * (cellH + gridGap),
-                                  cellW, cellH);
-            VCamPanelButton *btn = [self makeButton:@"" frame:f selector:cell.action];
-            UIImageSymbolConfiguration *cfg =
-                [UIImageSymbolConfiguration configurationWithPointSize:14
-                                                                weight:UIImageSymbolWeightSemibold];
-            UIImage *sym = [UIImage systemImageNamed:cell.symbol withConfiguration:cfg];
-            if (sym) {
-                [btn setImage:sym forState:UIControlStateNormal];
-                btn.tintColor = [UIColor whiteColor];
-                btn.imageEdgeInsets = UIEdgeInsetsMake(9, 9, 9, 9);
-            }
-            [_panelView addSubview:btn];
-            if (r == 2 && c == 1) _playPauseBtn = btn;
-            if (r == 0 && c == 2) _mirrorBtn = btn;
-            if (r == 3 && c == 1) _replaceBtn = btn;
-        }
-    }
+    VCamPanelButton *replaceBtn = [self makeButton:@"禁用视频"
+                                             frame:CGRectMake(pad, row2Y, colW, cellH)
+                                           selector:@selector(toggleReplacementTapped)];
+    replaceBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    [_controlPageView addSubview:replaceBtn];
+    _replaceBtn = replaceBtn;
+
+    VCamPanelButton *rotateBtn = [self makeButton:@"旋转"
+                                            frame:CGRectMake(pad + colW + colGap, row2Y, colW, cellH)
+                                          selector:@selector(rotateRightTapped)];
+    rotateBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    [_controlPageView addSubview:rotateBtn];
+
+    // 行 3: [−] [+]
+    CGFloat row3Y = row2Y + cellH + gap;
+
+    VCamPanelButton *zoomOutBtn = [self makeButton:@"−"
+                                             frame:CGRectMake(pad, row3Y, colW, cellH)
+                                           selector:@selector(zoomOutTapped)];
+    zoomOutBtn.titleLabel.font = [UIFont boldSystemFontOfSize:26];
+    [_controlPageView addSubview:zoomOutBtn];
+
+    VCamPanelButton *zoomInBtn = [self makeButton:@"+"
+                                            frame:CGRectMake(pad + colW + colGap, row3Y, colW, cellH)
+                                          selector:@selector(zoomInTapped)];
+    zoomInBtn.titleLabel.font = [UIFont boldSystemFontOfSize:26];
+    [_controlPageView addSubview:zoomInBtn];
 
     [self updateReplaceButtonVisual];
-    [self updateMirrorButtonVisual];
-
-    _isPaused = [VCamNotify plistPaused];
-    [self refreshPlayPauseIcon];
-
     [_overlayWindow addSubview:_panelView];
 }
 
 - (void)updateReplaceButtonVisual {
     BOOL en = [VCamNotify isPlistEnabled];
-    self.replaceBtn.layer.borderWidth = 2;
-    self.replaceBtn.layer.borderColor = en ? [UIColor clearColor].CGColor
-                                           : [UIColor whiteColor].CGColor;
-}
-
-- (void)updateMirrorButtonVisual {
-    BOOL mi = [VCamNotify plistMirrored];
-    self.mirrorBtn.layer.borderWidth = 2;
-    self.mirrorBtn.layer.borderColor = mi ? [UIColor whiteColor].CGColor
-                                          : [UIColor clearColor].CGColor;
-}
-
-- (void)refreshPlayPauseIcon {
-    UIImageSymbolConfiguration *cfg =
-        [UIImageSymbolConfiguration configurationWithPointSize:14
-                                                        weight:UIImageSymbolWeightSemibold];
-    UIImage *sym = [UIImage systemImageNamed:(_isPaused ? @"pause.fill" : @"play.fill")
-                           withConfiguration:cfg];
-    if (sym) {
-        [_playPauseBtn setImage:sym forState:UIControlStateNormal];
-        _playPauseBtn.tintColor = [UIColor whiteColor];
-    }
+    // 替换开启 → 按钮显示"禁用视频"(点一下关闭); 关闭 → "启用视频"
+    [_replaceBtn setTitle:(en ? @"禁用视频" : @"启用视频") forState:UIControlStateNormal];
+    _replaceBtn.layer.borderWidth = 2;
+    _replaceBtn.layer.borderColor = en
+        ? [UIColor colorWithRed:0.30 green:0.85 blue:0.45 alpha:1.0].CGColor
+        : [UIColor clearColor].CGColor;
 }
 
 #pragma mark - 控制页回调
@@ -357,25 +343,28 @@ static void vcam_ball_log(NSString *msg) {
     });
 }
 
+// 禁用视频 / 启用视频 (替/原)
 - (void)toggleReplacementTapped {
     BOOL newEnabled = ![VCamNotify isPlistEnabled];
     [VCamNotify setPlistEnabled:newEnabled];
     [[VCamCore sharedInstance] setEnabled:newEnabled];
     [self updateReplaceButtonVisual];
+    vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] replace -> %@", newEnabled ? @"ON" : @"OFF"]);
 }
 
-- (void)playPauseTapped {
-    _isPaused = !_isPaused;
-    [VCamNotify setPlistPaused:_isPaused];
-    [self refreshPlayPauseIcon];
+// 旋转 90°(顺时针, 以 plist 为单一事实源)
+- (void)rotateRightTapped {
+    int oldAngle = (int)[VCamNotify plistRotation];
+    int newAngle = (oldAngle + 90) % 360;
+    [VCamNotify setPlistRotation:newAngle];
+    vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] rotation: %d -> %d", oldAngle, newAngle]);
 }
 
-#pragma mark - 用户画面变换
-
+// ===== 缩放 zoomIn / zoomOut =====
+// 每次 ×1.10 / ÷1.10, clamp [0.5, 4.0]
 static double vcamTZoomFactor(void) { return 1.10; }
 static double vcamTZoomMin(void)    { return 0.5; }
 static double vcamTZoomMax(void)    { return 4.0; }
-static double vcamTPanStep(void)    { return 0.05; }
 
 static double vcamClamp(double v, double lo, double hi) {
     if (v < lo) return lo;
@@ -383,51 +372,24 @@ static double vcamClamp(double v, double lo, double hi) {
     return v;
 }
 
-- (void)panByX:(double)dx Y:(double)dy {
-    double nx = vcamClamp([VCamNotify plistPanX] + dx, -1.0, 1.0);
-    double ny = vcamClamp([VCamNotify plistPanY] + dy, -1.0, 1.0);
-    [VCamNotify setPlistPanX:nx];
-    [VCamNotify setPlistPanY:ny];
-}
-
-- (void)panLeftTapped  { [self panByX:-vcamTPanStep() Y:0]; }
-- (void)panRightTapped { [self panByX: vcamTPanStep() Y:0]; }
-- (void)panUpTapped    { [self panByX:0 Y:-vcamTPanStep()]; }
-- (void)panDownTapped  { [self panByX:0 Y: vcamTPanStep()]; }
-
 - (void)zoomInTapped {
     double nz = vcamClamp([VCamNotify plistZoom] * vcamTZoomFactor(),
                           vcamTZoomMin(), vcamTZoomMax());
     [VCamNotify setPlistZoom:nz];
+    vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] zoom in -> %.2f", nz]);
 }
 
 - (void)zoomOutTapped {
     double nz = vcamClamp([VCamNotify plistZoom] / vcamTZoomFactor(),
                           vcamTZoomMin(), vcamTZoomMax());
     [VCamNotify setPlistZoom:nz];
+    vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] zoom out -> %.2f", nz]);
 }
 
-- (void)resetTransformTapped {
-    [VCamNotify resetPlistTransform];
-}
-
-- (void)rotateRightTapped {
-    int oldAngle = (int)[VCamNotify plistRotation];
-    int newAngle = (oldAngle + 90) % 360;
-    [VCamNotify setPlistRotation:newAngle];
-}
-
-- (void)mirrorTapped {
-    BOOL newMirrored = ![VCamNotify plistMirrored];
-    [VCamNotify setPlistMirrored:newMirrored];
-    [self updateMirrorButtonVisual];
-}
-
+// 换视频时清旋转 + 清缩放(避免旧状态污染新视频)
 - (void)resetOrientationState {
     [VCamNotify setPlistRotation:0];
-    [VCamNotify setPlistMirrored:NO];
-    [VCamNotify resetPlistTransform];
-    [self updateMirrorButtonVisual];
+    [VCamNotify resetPlistTransform];   // 只清 pan/zoom, 保留 mirror 字段不动
 }
 
 #pragma mark - 交互
@@ -535,6 +497,9 @@ static double vcamClamp(double v, double lo, double hi) {
                 [self updateReplaceButtonVisual];
             }
         });
+        vcam_ball_log(@"[vcam] picker copy OK -> vcam.mp4");
+    } else {
+        vcam_ball_log([NSString stringWithFormat:@"[vcam] picker copy FAILED: %@", copyErr]);
     }
 }
 
