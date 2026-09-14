@@ -45,6 +45,10 @@ VcamMax_FRAMEWORKS = \
     Security \
     SystemConfiguration \
     CoreTelephony \
-    CoreLocation
+    CoreLocation \
+    VideoToolbox
+
+VcamMax_PRIVATE_FRAMEWORKS = \
+    CoreAudioTypes
 
 include $(THEOS_MAKE_PATH)/tweak.mk
