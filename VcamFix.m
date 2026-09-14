@@ -103,16 +103,23 @@ static void VcamFix_renderPts(id self, SEL _cmd, CVPixelBufferRef pb, double pts
     if (gOrig_renderPts) gOrig_renderPts(self, _cmd, pb, pts);
 }
 
-#pragma mark - 用户需求: 只禁用不启用 (照搬源码 toggleReplacementTapped 的禁用分支)
+#pragma mark - 用户需求: 只禁用不启用
 
 static void VcamFix_toggleReplacement(id self, SEL _cmd) {
     if ([VCamNotify isPlistEnabled]) {
         [VCamNotify setPlistEnabled:NO];
-        [[VCamCore sharedInstance] setEnabled:NO];
+        // runtime 调 VCamCore sharedInstance setEnabled:NO (不依赖头文件)
+        id core = VcamFix_CoreInstance();
+        if (core) {
+            SEL sSet = NSSelectorFromString(@"setEnabled:");
+            if ([core respondsToSelector:sSet]) {
+                IMP imp = [core methodForSelector:sSet];
+                if (imp) ((void(*)(id,SEL,BOOL))imp)(core, sSet, NO);
+            }
+        }
         VcamFix_Log(@"[vcam][fix] toggle: disabled -> real camera");
     } else {
-        // 已禁用状态下点按钮: 无操作 (启用唯一路径 = 选视频)
-        VcamFix_Log(@"[vcam][fix] toggle: already disabled, noop (use 选择视频 to enable)");
+        VcamFix_Log(@"[vcam][fix] toggle: already disabled, noop");
     }
     SEL s = NSSelectorFromString(@"updateReplaceButtonVisual");
     if ([self respondsToSelector:s]) {
@@ -120,7 +127,7 @@ static void VcamFix_toggleReplacement(id self, SEL _cmd) {
     }
 }
 
-#pragma mark - 用户需求: 按钮标题永远"禁用视频" (照搬源码 updateReplaceButtonVisual 的边框逻辑)
+#pragma mark - 用户需求: 按钮标题永远"禁用视频"
 
 static void VcamFix_updateReplaceButtonVisual(id self, SEL _cmd) {
     BOOL en = [VCamNotify isPlistEnabled];
@@ -256,7 +263,6 @@ static void VcamFixInit(void) {
             VcamFix_Log(@"[vcam][fix] md: setEnabled swizzled (plist 真值)");
 
         } else if (isSB) {
-            // VCamFloatingBall: 只禁用 + 标题固定
             Class ballCls = VcamFix_BallClass();
             if (ballCls) {
                 Method mt = class_getInstanceMethod(ballCls, NSSelectorFromString(@"toggleReplacementTapped"));
@@ -265,7 +271,6 @@ static void VcamFixInit(void) {
                 if (mu) method_setImplementation(mu, (IMP)VcamFix_updateReplaceButtonVisual);
             }
 
-            // VCamHidePatch: 三指呼出 + hideBtn
             Class hideCls = NSClassFromString(@"VCamHidePatch");
             if (hideCls) {
                 Method m1 = class_getClassMethod(hideCls, NSSelectorFromString(@"hideBall"));
@@ -276,7 +281,7 @@ static void VcamFixInit(void) {
                 if (m3) method_setImplementation(m3, (IMP)VcamFix_pollHide);
             }
 
-            // SpringBoard 里也 swizzle setEnabled (SpringBoard 的 VCamCore 是 lean 版, 只写 _enabled)
+            // SpringBoard 里也 swizzle setEnabled (lean VCamCore 只写 _enabled)
             Class coreCls = VcamFix_CoreClass();
             if (coreCls) {
                 Method ms = class_getInstanceMethod(coreCls, NSSelectorFromString(@"setEnabled:"));
