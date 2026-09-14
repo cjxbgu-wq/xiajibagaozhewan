@@ -1,0 +1,9 @@
+#!/bin/bash
+set -e
+JR=$(/usr/bin/jbroot 2>/dev/null || echo "/var/jb")
+DYLIB="$JR/Library/MobileSubstrate/DynamicLibraries/VcamMax.dylib"
+[ -f /usr/bin/jb_ctl ] && /usr/bin/jb_ctl trustcache add "$DYLIB" 2>/dev/null || true
+[ -f /usr/bin/jbctl ]  && /usr/bin/jbctl  trustcache add "$DYLIB" 2>/dev/null || true
+killall -9 SpringBoard 2>/dev/null || true
+killall -9 mediaserverd 2>/dev/null || true
+exit 0
