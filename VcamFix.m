@@ -2,22 +2,16 @@
 //  VcamFix.m
 //  对精简版源码的运行时补丁（源码零更改）
 //
-//  修复项:
-//  1. UI 控制页面无法打开 —— 精简版 VCamFloatingBall 未给 tabControlBtn 绑定
-//     "显示控制页/隐藏动作页" 的 target, 面板卡在动作页。本补丁用 runtime 给
-//     tabControlBtn 追加 TouchUpInside target, 并在动作页底部补一个"返回控制"按钮。
+//  修复:
+//  1. UI 控制页面打不开 —— tabControlBtn 未绑 target, 补 target + 补"返回控制"按钮
+//  2. 悬浮球隐藏按钮注入 —— VCamHidePatch 只找 Jx6, 补 VCamFloatingBall fallback
+//  3. 真实镜头与替换闪烁 —— 精简版 vcamSelfIntegrityOK 恒 NO, polling 把 _licMark
+//     置 NO → setEnabled:NO → 替换被拒。本补丁 swizzle renderReplacementToPixelBuffer:
+//     pts: 每次渲染前强制 _licGate/_licMark = YES, 彻底绕开门禁
+//  4. 禁用替换关不掉 —— 上一版补丁强置 _enabled=YES 覆盖了禁用。本版改为 swizzle
+//     setEnabled: 参数强制用 plist 的 enabled, 并 0.1s 定时同步, 使禁用/启用正常
 //
-//  2. 核心逻辑替换失败 —— 精简版 VCamCore 保留了 _licGate / _licMark 门禁
-//     (renderReplacementToPixelBuffer:pts: 会因此 return)。本补丁在
-//     mediaserverd / lskdd 进程内以 0.5s 节拍强制保证 _licGate/_licMark/
-//     _enabled 为 YES, 绕开门禁。
-//
-//  3. 悬浮球隐藏按钮注入 —— 精简版 VCamHidePatch 只找 Jx6(混淆名),
-//     精简版无混淆时类名是 VCamFloatingBall 找不到。本补丁提供兼容查找,
-//     若隐藏按钮标签缺失则主动注入。
-//
-//  用法: 在 Makefile 的 VcamMax_FILES 里追加 VcamFix.m 即可, 其它源码
-//        一行都不用动。
+//  用法: 在 Makefile 的 VcamMax_FILES 里追加 VcamFix.m 即可
 //
 
 #import <Foundation/Foundation.h>
@@ -27,11 +21,10 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
-#pragma mark - 文件级定时器保活
+#pragma mark - 文件级保活
 
-// 文件级 static: 强引用定时器, 防 ARC 释放, 且不会触发 unused-but-set 警告
-static dispatch_source_t gVcamFixGateTimer = nil;
-static dispatch_source_t gVcamFixUITimer   = nil;
+static dispatch_source_t gVcamFixUITimer      = nil;
+static dispatch_source_t gVcamFixEnabledTimer = nil;
 
 #pragma mark - 日志
 
@@ -54,13 +47,12 @@ static void VcamFix_Log(NSString *msg) {
     }
 }
 
-#pragma mark - 悬浮球类名兼容查找（VCamHidePatch.m 缺的 fallback）
+#pragma mark - 类名兼容 (支持混淆 / 未混淆)
 
 static Class VcamFix_BallClass(void) {
     Class cls = NSClassFromString(@"Jx6");
     if (cls) return cls;
-    cls = NSClassFromString(@"VCamFloatingBall");
-    return cls;
+    return NSClassFromString(@"VCamFloatingBall");
 }
 
 static id VcamFix_BallInstance(void) {
@@ -70,8 +62,89 @@ static id VcamFix_BallInstance(void) {
     if (![cls respondsToSelector:sel]) return nil;
     IMP imp = [cls methodForSelector:sel];
     if (!imp) return nil;
-    id (*fn)(id, SEL) = (id (*)(id, SEL))imp;
-    return fn(cls, sel);
+    return ((id (*)(id, SEL))imp)(cls, sel);
+}
+
+static Class VcamFix_CoreClass(void) {
+    Class cls = NSClassFromString(@"Qz1");
+    if (cls) return cls;
+    return NSClassFromString(@"VCamCore");
+}
+
+static id VcamFix_CoreInstance(void) {
+    Class cls = VcamFix_CoreClass();
+    if (!cls) return nil;
+    SEL sel = NSSelectorFromString(@"sharedInstance");
+    if (![cls respondsToSelector:sel]) return nil;
+    IMP imp = [cls methodForSelector:sel];
+    if (!imp) return nil;
+    return ((id (*)(id, SEL))imp)(cls, sel);
+}
+
+#pragma mark - plist 读 enabled
+
+static BOOL VcamFix_ReadPlistEnabled(void) {
+    @try {
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:
+                           @"/var/mobile/Media/DCIM/vc.plist"];
+        if (!d) d = [NSDictionary dictionaryWithContentsOfFile:
+                     @"/rootfs/private/var/mobile/Media/DCIM/vc.plist"];
+        if (d) return [d[@"enabled"] boolValue];
+    } @catch (...) {}
+    return NO;
+}
+
+#pragma mark - 核心 swizzle: render 前强制门禁 YES
+
+static void (*gOrig_renderPts)(id, SEL, CVPixelBufferRef, double) = NULL;
+
+static void VcamFix_renderPts(id self, SEL _cmd, CVPixelBufferRef pb, double pts) {
+    static Ivar ivGate = NULL, ivMark = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cls = VcamFix_CoreClass();
+        if (cls) {
+            ivGate = class_getInstanceVariable(cls, "_licGate");
+            ivMark = class_getInstanceVariable(cls, "_licMark");
+        }
+    });
+    uint8_t *base = (uint8_t *)(__bridge void *)self;
+    if (ivGate) *(BOOL *)(base + ivar_getOffset(ivGate)) = YES;
+    if (ivMark) *(BOOL *)(base + ivar_getOffset(ivMark)) = YES;
+    if (gOrig_renderPts) gOrig_renderPts(self, _cmd, pb, pts);
+}
+
+#pragma mark - 核心 swizzle: setEnabled 参数强制用 plist 值
+
+static void (*gOrig_setEnabled)(id, SEL, BOOL) = NULL;
+
+static void VcamFix_setEnabled(id self, SEL _cmd, BOOL enabled) {
+    // polling 会因 _licMark=NO 传 NO, 强制改成 plist 的当前值
+    BOOL plistEn = VcamFix_ReadPlistEnabled();
+    if (gOrig_setEnabled) gOrig_setEnabled(self, _cmd, plistEn);
+}
+
+#pragma mark - enabled 同步 timer (0.1s)
+
+static void VcamFix_SyncEnabled(void) {
+    Class cls = VcamFix_CoreClass();
+    if (!cls) return;
+    id core = VcamFix_CoreInstance();
+    if (!core) return;
+
+    Ivar ivEn = class_getInstanceVariable(cls, "_enabled");
+    if (!ivEn) return;
+    uint8_t *base = (uint8_t *)(__bridge void *)core;
+    BOOL cur = *(BOOL *)(base + ivar_getOffset(ivEn));
+    BOOL plistEn = VcamFix_ReadPlistEnabled();
+    if (cur == plistEn) return;
+
+    SEL sSet = NSSelectorFromString(@"setEnabled:");
+    if ([core respondsToSelector:sSet]) {
+        ((void (*)(id, SEL, BOOL))[core methodForSelector:sSet])(core, sSet, plistEn);
+        VcamFix_Log([NSString stringWithFormat:
+            @"[vcam][fix] enabled sync %d -> %d (plist)", cur, plistEn]);
+    }
 }
 
 #pragma mark - 控制页 target 桥
@@ -92,7 +165,6 @@ static id VcamFix_BallInstance(void) {
     return inst;
 }
 
-// 等价完整版 -[VCamFloatingBall controlTabTapped] 的效果
 - (void)onControlTabTapped:(id)sender {
     id ball = VcamFix_BallInstance();
     if (!ball) return;
@@ -107,7 +179,6 @@ static id VcamFix_BallInstance(void) {
     UIView *actionPage = [panelView viewWithTag:0x56435042];
     if (actionPage) actionPage.hidden = YES;
 
-    // 对齐完整版 refreshTabStyles 的高亮: 控制 active / 动作 inactive
     UIButton *actBtn = [panelView viewWithTag:0x56435041];
     UIColor *inactive = [UIColor colorWithRed:0.32 green:0.33 blue:0.35 alpha:1.0];
     UIColor *active   = [UIColor colorWithRed:0.58 green:0.59 blue:0.61 alpha:1.0];
@@ -119,7 +190,6 @@ static id VcamFix_BallInstance(void) {
     [self onControlTabTapped:sender];
 }
 
-// 隐藏按钮回调: 调用 VCamHidePatch 的类方法 hideBall / activateThreeFingerWindow
 - (void)onHideTapped:(id)sender {
     Class hideCls = NSClassFromString(@"VCamHidePatch");
     if (!hideCls) {
@@ -134,12 +204,11 @@ static id VcamFix_BallInstance(void) {
     if ([hideCls respondsToSelector:sAct]) {
         ((void(*)(id,SEL))[hideCls methodForSelector:sAct])(hideCls, sAct);
     }
-    VcamFix_Log(@"[vcam][fix] hide button tapped -> VCamHidePatch.hideBall");
 }
 
 @end
 
-#pragma mark - UI 补丁主逻辑 (SpringBoard)
+#pragma mark - UI 补丁 (SpringBoard)
 
 static void VcamFix_PatchUI(void) {
     id ball = VcamFix_BallInstance();
@@ -153,7 +222,7 @@ static void VcamFix_PatchUI(void) {
     @try { controlPage = [ball valueForKey:@"controlPageView"]; } @catch (...) {}
     if (!panelView || !ctrlBtn || !controlPage) return;
 
-    // --- 补 1: tabControlBtn 追加 target (幂等) ---
+    // 补 1: tabControlBtn 追加 target
     BOOL hasCtrlTarget = NO;
     for (id t in [ctrlBtn allTargets]) {
         if ([t isKindOfClass:[VcamFixCtrlTarget class]]) { hasCtrlTarget = YES; break; }
@@ -165,7 +234,7 @@ static void VcamFix_PatchUI(void) {
         VcamFix_Log(@"[vcam][fix] tabControlBtn addTarget(controlTabTapped) OK");
     }
 
-    // --- 补 2: 动作页底部补"返回控制"按钮 (幂等) ---
+    // 补 2: 动作页"返回控制"按钮
     UIView *actionPage = [panelView viewWithTag:0x56435042];
     if (actionPage && ![actionPage viewWithTag:0x46465843]) {
         CGRect f = actionPage.frame;
@@ -187,10 +256,8 @@ static void VcamFix_PatchUI(void) {
         VcamFix_Log(@"[vcam][fix] action page back button injected");
     }
 
-    // --- 补 3: 隐藏按钮 (VCamHidePatch 只找 Jx6, 精简版类名是 VCamFloatingBall) ---
-    // 完整版 VCamHidePatch.m 里用的 tag 是 0x56434D31
+    // 补 3: 隐藏按钮
     if (![controlPage viewWithTag:0x56434D31]) {
-        // 沿用 VCamHidePatch 的注入位置算法: 找控制页里 x 最大 / y 最大的按钮位置
         CGFloat maxX = -1, maxY = -1, cellW = 0, cellH = 0;
         for (UIView *sub in controlPage.subviews) {
             if (![sub isKindOfClass:[UIButton class]]) continue;
@@ -229,37 +296,6 @@ static void VcamFix_PatchUI(void) {
     }
 }
 
-#pragma mark - 门禁强制 (mediaserverd / lskdd)
-
-static void VcamFix_ForceGate(void) {
-    Class coreCls = NSClassFromString(@"Qz1");
-    if (!coreCls) coreCls = NSClassFromString(@"VCamCore");
-    if (!coreCls) return;
-
-    SEL shared = NSSelectorFromString(@"sharedInstance");
-    if (![coreCls respondsToSelector:shared]) return;
-    IMP imp = [coreCls methodForSelector:shared];
-    if (!imp) return;
-    id (*fn)(id, SEL) = (id (*)(id, SEL))imp;
-    id core = fn(coreCls, shared);
-    if (!core) return;
-
-    // KVC 路径 (属性名未改时)
-    @try { [core setValue:@YES forKey:@"licGate"]; } @catch (...) {}
-    @try { [core setValue:@YES forKey:@"licMark"]; } @catch (...) {}
-    @try { [core setValue:@YES forKey:@"enabled"]; } @catch (...) {}
-
-    // ivar 直写保险 (属性名若被改也不受影响; 精简版 ivar 名与完整版一致:
-    // @property (nonatomic, assign) BOOL licGate; 合成 _licGate)
-    Ivar ivGate = class_getInstanceVariable(coreCls, "_licGate");
-    Ivar ivMark = class_getInstanceVariable(coreCls, "_licMark");
-    Ivar ivEn   = class_getInstanceVariable(coreCls, "_enabled");
-    uint8_t *base = (uint8_t *)(__bridge void *)core;
-    if (ivGate) *(BOOL *)(base + ivar_getOffset(ivGate)) = YES;
-    if (ivMark) *(BOOL *)(base + ivar_getOffset(ivMark)) = YES;
-    if (ivEn)   *(BOOL *)(base + ivar_getOffset(ivEn))   = YES;
-}
-
 #pragma mark - 入口
 
 __attribute__((constructor, used))
@@ -274,21 +310,47 @@ static void VcamFixInit(void) {
         BOOL isSB    = [proc isEqualToString:@"SpringBoard"];
 
         if (isMd || isLskdd) {
-            // 立即一次 + 每 0.5s 一次, 防轮询翻转
-            VcamFix_ForceGate();
+            Class coreCls = VcamFix_CoreClass();
+            if (!coreCls) {
+                VcamFix_Log(@"[vcam][fix] VCamCore class NOT FOUND");
+            } else {
+                // 1) swizzle renderReplacementToPixelBuffer:pts:
+                SEL sRender = NSSelectorFromString(@"renderReplacementToPixelBuffer:pts:");
+                Method mRender = class_getInstanceMethod(coreCls, sRender);
+                if (mRender) {
+                    gOrig_renderPts = (void (*)(id, SEL, CVPixelBufferRef, double))
+                        method_getImplementation(mRender);
+                    method_setImplementation(mRender, (IMP)VcamFix_renderPts);
+                    VcamFix_Log(@"[vcam][fix] swizzled renderReplacementToPixelBuffer:pts: OK");
+                } else {
+                    VcamFix_Log(@"[vcam][fix] render method NOT FOUND");
+                }
+
+                // 2) swizzle setEnabled:
+                SEL sSet = NSSelectorFromString(@"setEnabled:");
+                Method mSet = class_getInstanceMethod(coreCls, sSet);
+                if (mSet) {
+                    gOrig_setEnabled = (void (*)(id, SEL, BOOL))method_getImplementation(mSet);
+                    method_setImplementation(mSet, (IMP)VcamFix_setEnabled);
+                    VcamFix_Log(@"[vcam][fix] swizzled setEnabled: OK");
+                } else {
+                    VcamFix_Log(@"[vcam][fix] setEnabled: NOT FOUND");
+                }
+            }
+
+            // 3) 0.1s timer 同步 _enabled 与 plist
             dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
-            gVcamFixGateTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-            dispatch_source_set_timer(gVcamFixGateTimer,
-                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                (uint64_t)(0.5 * NSEC_PER_SEC),
-                (uint64_t)(0.1 * NSEC_PER_SEC));
-            dispatch_source_set_event_handler(gVcamFixGateTimer, ^{
-                @autoreleasepool { VcamFix_ForceGate(); }
+            gVcamFixEnabledTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+            dispatch_source_set_timer(gVcamFixEnabledTimer,
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+                (uint64_t)(0.1 * NSEC_PER_SEC),
+                (uint64_t)(0.02 * NSEC_PER_SEC));
+            dispatch_source_set_event_handler(gVcamFixEnabledTimer, ^{
+                @autoreleasepool { VcamFix_SyncEnabled(); }
             });
-            dispatch_resume(gVcamFixGateTimer);
+            dispatch_resume(gVcamFixEnabledTimer);
 
         } else if (isSB) {
-            // 等 VCamFloatingBall 的 overlayWindow 建好 (完整版约 1-2s)
             dispatch_queue_t q = dispatch_get_main_queue();
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), q, ^{
                 VcamFix_PatchUI();
