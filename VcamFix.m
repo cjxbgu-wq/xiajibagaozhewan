@@ -27,6 +27,12 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+#pragma mark - 文件级定时器保活
+
+// 文件级 static: 强引用定时器, 防 ARC 释放, 且不会触发 unused-but-set 警告
+static dispatch_source_t gVcamFixGateTimer = nil;
+static dispatch_source_t gVcamFixUITimer   = nil;
+
 #pragma mark - 日志
 
 static void VcamFix_Log(NSString *msg) {
@@ -271,17 +277,15 @@ static void VcamFixInit(void) {
             // 立即一次 + 每 0.5s 一次, 防轮询翻转
             VcamFix_ForceGate();
             dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
-            dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-            dispatch_source_set_timer(t,
+            gVcamFixGateTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+            dispatch_source_set_timer(gVcamFixGateTimer,
                 dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                 (uint64_t)(0.5 * NSEC_PER_SEC),
                 (uint64_t)(0.1 * NSEC_PER_SEC));
-            dispatch_source_set_event_handler(t, ^{
+            dispatch_source_set_event_handler(gVcamFixGateTimer, ^{
                 @autoreleasepool { VcamFix_ForceGate(); }
             });
-            dispatch_resume(t);
-            static dispatch_source_t sKeep = nil;
-            sKeep = t;   // 文件级保活, 防 ARC 释放
+            dispatch_resume(gVcamFixGateTimer);
 
         } else if (isSB) {
             // 等 VCamFloatingBall 的 overlayWindow 建好 (完整版约 1-2s)
@@ -289,17 +293,15 @@ static void VcamFixInit(void) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), q, ^{
                 VcamFix_PatchUI();
             });
-            dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-            dispatch_source_set_timer(t,
+            gVcamFixUITimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+            dispatch_source_set_timer(gVcamFixUITimer,
                 dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                 (uint64_t)(1.0 * NSEC_PER_SEC),
                 (uint64_t)(0.2 * NSEC_PER_SEC));
-            dispatch_source_set_event_handler(t, ^{
+            dispatch_source_set_event_handler(gVcamFixUITimer, ^{
                 @autoreleasepool { VcamFix_PatchUI(); }
             });
-            dispatch_resume(t);
-            static dispatch_source_t sKeep2 = nil;
-            sKeep2 = t;
+            dispatch_resume(gVcamFixUITimer);
         }
     }
 }
