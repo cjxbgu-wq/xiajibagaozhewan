@@ -125,12 +125,14 @@ static void VCAP_SetDict(NSDictionary *updates) {
 #define kActionMaxSec  6.0
 
 // ============================================================
-//  悬浮球实例查找（通过混淆类名 Jx6）
+//  悬浮球实例查找（兼容混淆名 Jx6 与未混淆名 VCamFloatingBall）
 // ============================================================
 static Class VCAP_FindBallClass(void) {
     static Class cls = Nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ cls = NSClassFromString(@"Jx6"); });
+    dispatch_once(&once, ^{
+        cls = NSClassFromString(@"Jx6") ?: NSClassFromString(@"VCamFloatingBall");
+    });
     return cls;
 }
 
@@ -330,7 +332,6 @@ static id VCAP_FindBallInstance(void) {
     page.backgroundColor = [UIColor clearColor];
 
     CGFloat y = 0;
-    CGFloat btnY = 0;
 
     // 分组 1：动作按键
     UILabel *grp1 = [[UILabel alloc] initWithFrame:CGRectMake(pad, y, contentW, labelH)];
