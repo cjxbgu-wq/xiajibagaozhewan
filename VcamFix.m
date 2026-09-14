@@ -1,5 +1,6 @@
 //
-//  VcamFix.m — 照搬源码逻辑, 只 swizzle 精简版失效之处
+//  VcamFix.m — 照搬源码逻辑 + 自带诊断日志
+//  diag 日志走 /tmp (mediaserverd 可写)
 //
 
 #import <Foundation/Foundation.h>
@@ -8,30 +9,134 @@
 #import <objc/message.h>
 #import "VCamNotify.h"
 
-// 文件级 timer 保活 (防 ARC 释放, 且不触发 unused-but-set 警告)
 static dispatch_source_t gTimerMD   = nil;
 static dispatch_source_t gTimerSB   = nil;
+static dispatch_source_t gTimerDiag = nil;
 
-#pragma mark - 日志
-static void VcamFix_Log(NSString *msg) {
-    NSString *entry = [NSString stringWithFormat:@"[%@][fix] %@\n", [NSDate date], msg];
-    NSArray *paths = @[@"/tmp/vcam_fix_log.txt", @"/var/mobile/Media/DCIM/vcam_fix_log.txt"];
+#pragma mark - 日志 (多路径 fallback)
+
+static void VcamFix_WriteTo(NSString *line, NSArray<NSString *> *paths) {
     for (NSString *path in paths) {
         @try {
             NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
             if (!fh) {
-                [entry writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                if ([line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+                    return;
+                }
             } else {
                 [fh seekToEndOfFile];
-                [fh writeData:[entry dataUsingEncoding:NSUTF8StringEncoding]];
+                [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
                 [fh closeFile];
+                return;
             }
-            return;
         } @catch (NSException *e) {}
     }
 }
 
-#pragma mark - 类名兼容 (照搬源码 VCamActionPatch.m 的 fallback)
+static void VcamFix_Log(NSString *msg) {
+    NSString *entry = [NSString stringWithFormat:@"[%@][fix] %@\n", [NSDate date], msg];
+    VcamFix_WriteTo(entry, @[
+        @"/tmp/vcam_fix_log.txt",
+        @"/var/mobile/Media/DCIM/vcam_fix_log.txt",
+        @"/private/var/tmp/vcam_fix_log.txt",
+    ]);
+}
+
+static void VcamFix_DiagLine(NSString *line) {
+    VcamFix_WriteTo(line, @[
+        @"/tmp/vcam_diag.txt",
+        @"/var/mobile/Media/DCIM/vcam_diag.txt",
+        @"/private/var/tmp/vcam_diag.txt",
+    ]);
+}
+
+#pragma mark - 诊断: 打出 mediaserverd 侧 VCamCore 全部关键状态
+
+static void VcamFix_Diag(void) {
+    Class cls = NSClassFromString(@"Qz1");
+    if (!cls) cls = NSClassFromString(@"VCamCore");
+    if (!cls) {
+        VcamFix_DiagLine([NSString stringWithFormat:@"[%@] DIAG: VCamCore class NOT FOUND\n", [NSDate date]]);
+        return;
+    }
+    SEL sShared = NSSelectorFromString(@"sharedInstance");
+    if (![cls respondsToSelector:sShared]) {
+        VcamFix_DiagLine([NSString stringWithFormat:@"[%@] DIAG: sharedInstance NOT FOUND\n", [NSDate date]]);
+        return;
+    }
+    IMP imp = [cls methodForSelector:sShared];
+    if (!imp) return;
+    id core = ((id(*)(id,SEL))imp)(cls, sShared);
+    if (!core) {
+        VcamFix_DiagLine([NSString stringWithFormat:@"[%@] DIAG: core is nil\n", [NSDate date]]);
+        return;
+    }
+
+    uint8_t *base = (uint8_t *)(__bridge void *)core;
+    Ivar ivMd   = class_getInstanceVariable(cls, "_isMediaserverdProcess");
+    Ivar ivEn   = class_getInstanceVariable(cls, "_enabled");
+    Ivar ivG    = class_getInstanceVariable(cls, "_licGate");
+    Ivar ivM    = class_getInstanceVariable(cls, "_licMark");
+    Ivar ivPre  = class_getInstanceVariable(cls, "_prerenderActive");
+    Ivar ivLive = class_getInstanceVariable(cls, "_liveYUVPixelBuffer");
+    Ivar ivIdle = class_getInstanceVariable(cls, "_pipelineIdle");
+
+    BOOL isMd = ivMd   ? *(BOOL *)(base + ivar_getOffset(ivMd))   : NO;
+    BOOL en   = ivEn   ? *(BOOL *)(base + ivar_getOffset(ivEn))   : NO;
+    BOOL lic  = ivG    ? *(BOOL *)(base + ivar_getOffset(ivG))    : NO;
+    BOOL mk   = ivM    ? *(BOOL *)(base + ivar_getOffset(ivM))    : NO;
+    BOOL pre  = ivPre  ? *(BOOL *)(base + ivar_getOffset(ivPre))  : NO;
+    BOOL idle = ivIdle ? *(BOOL *)(base + ivar_getOffset(ivIdle)) : NO;
+    CVPixelBufferRef live = ivLive ? *(CVPixelBufferRef *)(base + ivar_getOffset(ivLive)) : NULL;
+
+    id player = nil;
+    @try { player = [core valueForKey:@"videoPlayer"]; } @catch (...) {}
+    uint64_t fc = 0;
+    BOOL paused = NO;
+    NSInteger mtype = 0;
+    NSString *path = @"(nil)";
+    NSUInteger qcount = 0;
+    if (player) {
+        Ivar ivFc = class_getInstanceVariable([player class], "_frameCount");
+        if (!ivFc) ivFc = class_getInstanceVariable([player class], "frameCount");
+        if (ivFc) fc = *(uint64_t *)((uint8_t *)(__bridge void *)player + ivar_getOffset(ivFc));
+        @try { paused = [[player valueForKey:@"paused"] boolValue]; } @catch (...) {}
+        @try { mtype = [[player valueForKey:@"mediaType"] integerValue]; } @catch (...) {}
+        @try { path = [player valueForKey:@"currentVideoPath"]; } @catch (...) {}
+        id q = nil;
+        @try { q = [player valueForKey:@"frameQueue"]; } @catch (...) {}
+        if (q) { @try { qcount = [[q valueForKey:@"count"] unsignedIntegerValue]; } @catch (...) {} }
+    }
+
+    BOOL pEn = NO;
+    NSString *pPath = @"(nil)";
+    @try {
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
+        if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/rootfs/private/var/mobile/Media/DCIM/vc.plist"];
+        if (d) {
+            pEn = [d[@"enabled"] boolValue];
+            pPath = d[@"activePlaybackPath"] ?: @"(nil)";
+        }
+    } @catch (...) {}
+
+    BOOL fileExists = NO;
+    unsigned long long fileSize = 0;
+    if (path && ![path isEqualToString:@"(nil)"] && path.length > 0) {
+        NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+        if (attr) { fileExists = YES; fileSize = [attr fileSize]; }
+    }
+
+    NSString *line = [NSString stringWithFormat:
+        @"[%@] isMd=%d en=%d lic=%d mk=%d pre=%d idle=%d live=%s | plist.en=%d path=%@ | player.fc=%llu paused=%d mtype=%ld path=%@ fexists=%d fsize=%llu | q=%lu\n",
+        [NSDate date], isMd, en, lic, mk, pre, idle, live ? "YES" : "nil",
+        pEn, pPath,
+        fc, paused, (long)mtype, path ?: @"(nil)", fileExists, fileSize,
+        (unsigned long)qcount];
+
+    VcamFix_DiagLine(line);
+}
+
+#pragma mark - 类名兼容
 static Class VcamFix_BallClass(void) {
     Class c = NSClassFromString(@"Jx6");
     return c ?: NSClassFromString(@"VCamFloatingBall");
@@ -67,7 +172,7 @@ static BOOL VcamFix_ReadEnabled(void) {
     return NO;
 }
 
-#pragma mark - swizzle render: 每帧刷门禁
+#pragma mark - swizzle render
 static void (*gOrig_render)(id, SEL, CVPixelBufferRef, double) = NULL;
 static void VcamFix_render(id self, SEL _cmd, CVPixelBufferRef pb, double pts) {
     static Ivar ivG = NULL, ivM = NULL;
@@ -115,7 +220,7 @@ static void VcamFix_SyncEnabled(void) {
     VcamFix_Log([NSString stringWithFormat:@"[vcam][fix] setEnabled:%d", (int)plistEn]);
 }
 
-#pragma mark - swizzle VCamActionPatch.actionTabTapped (照搬完整版逻辑, 去掉 lightPage 检查)
+#pragma mark - swizzle actionTabTapped
 static void VcamFix_actionTabTapped(id self, SEL _cmd) {
     id ball = VcamFix_BallInstance();
     if (!ball) return;
@@ -143,9 +248,7 @@ static void VcamFix_actionTabTapped(id self, SEL _cmd) {
     SEL s2 = NSSelectorFromString(@"refreshDuration");
     if ([self respondsToSelector:s2]) ((void(*)(id,SEL))[self methodForSelector:s2])(self, s2);
 
-    CGFloat pageTop = actionPage.frame.origin.y;
-    CGFloat contentH = actionPage.frame.size.height;
-    CGFloat targetH = pageTop + contentH + 10;
+    CGFloat targetH = actionPage.frame.origin.y + actionPage.frame.size.height + 10;
     [UIView animateWithDuration:0.18 animations:^{
         CGRect f = panelView.frame;
         f.size.height = targetH;
@@ -158,7 +261,6 @@ static void VcamFix_actionTabTapped(id self, SEL _cmd) {
 + (instancetype)shared;
 - (void)onControlTabTapped:(id)sender;
 @end
-
 @implementation VcamFixCtrlTarget
 + (instancetype)shared {
     static VcamFixCtrlTarget *inst = nil;
@@ -166,7 +268,6 @@ static void VcamFix_actionTabTapped(id self, SEL _cmd) {
     dispatch_once(&once, ^{ inst = [[VcamFixCtrlTarget alloc] init]; });
     return inst;
 }
-
 - (void)onControlTabTapped:(id)sender {
     id ball = VcamFix_BallInstance();
     if (!ball) return;
@@ -214,7 +315,6 @@ static void VcamFix_hideBall(Class self, SEL _cmd) {
         [ball setValue:@NO forKey:@"panelVisible"];
     } @catch (...) {}
 }
-
 static void VcamFix_showBall(Class self, SEL _cmd) {
     @try {
         NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:VcamFix_PlistPath()];
@@ -229,7 +329,6 @@ static void VcamFix_showBall(Class self, SEL _cmd) {
         if (bv) bv.hidden = NO;
     } @catch (...) {}
 }
-
 static void VcamFix_pollHide(Class self, SEL _cmd) {
     static BOOL injected = NO;
     if (injected) return;
@@ -305,7 +404,6 @@ static void VcamFix_toggleReplacement(id self, SEL _cmd) {
     SEL s = NSSelectorFromString(@"updateReplaceButtonVisual");
     if ([self respondsToSelector:s]) ((void(*)(id,SEL))[self methodForSelector:s])(self, s);
 }
-
 static void VcamFix_updateReplaceButtonVisual(id self, SEL _cmd) {
     BOOL en = [VCamNotify isPlistEnabled];
     id btn = nil;
@@ -364,6 +462,18 @@ static void VcamFixInit(void) {
                 @autoreleasepool { VcamFix_SyncEnabled(); }
             });
             dispatch_resume(gTimerMD);
+
+            // 诊断: 立即打一行 + 每 0.5s 一行
+            VcamFix_Diag();
+            gTimerDiag = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+            dispatch_source_set_timer(gTimerDiag,
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                (uint64_t)(0.5 * NSEC_PER_SEC), (uint64_t)(0.05 * NSEC_PER_SEC));
+            dispatch_source_set_event_handler(gTimerDiag, ^{
+                @autoreleasepool { VcamFix_Diag(); }
+            });
+            dispatch_resume(gTimerDiag);
+
             VcamFix_Log(@"[vcam][fix] md init");
 
         } else if (isSB) {
@@ -388,7 +498,6 @@ static void VcamFixInit(void) {
                 Method m3 = class_getClassMethod(hideCls, NSSelectorFromString(@"pollForPanelAndInjectButton"));
                 if (m3) method_setImplementation(m3, (IMP)VcamFix_pollHide);
             }
-
             dispatch_queue_t q = dispatch_get_main_queue();
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), q, ^{
                 VcamFix_ensureControlTabTarget();
