@@ -1,0 +1,9 @@
+Package: com.example.vcammax
+Name: VcamMax
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: iOS 虚拟摄像头 Tweak（视频替换 / 动作切片 / 旋转 / 悬浮球）
+Maintainer: YourName
+Author: YourName
+Section: Tweaks
+Depends: mobilesubstrate | ellekit
