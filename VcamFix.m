@@ -1,7 +1,5 @@
 //
-//  VcamFix.m
-//  照搬源码逻辑, 只 swizzle 精简版失效/缺失的几处
-//  不新增任何 UI 按钮
+//  VcamFix.m — 照搬源码逻辑, 只 swizzle 精简版失效之处
 //
 
 #import <Foundation/Foundation.h>
@@ -10,10 +8,9 @@
 #import <objc/message.h>
 #import "VCamNotify.h"
 
-static dispatch_source_t gVcamFixGateTimer = nil;
+static dispatch_source_t gTimer = nil;
 
 #pragma mark - 日志
-
 static void VcamFix_Log(NSString *msg) {
     NSString *entry = [NSString stringWithFormat:@"[%@][fix] %@\n", [NSDate date], msg];
     NSArray *paths = @[@"/tmp/vcam_fix_log.txt", @"/var/mobile/Media/DCIM/vcam_fix_log.txt"];
@@ -32,12 +29,10 @@ static void VcamFix_Log(NSString *msg) {
     }
 }
 
-#pragma mark - 类名兼容 (照搬源码 VCamActionPatch.m 的 Jx6 ?: VCamFloatingBall)
-
+#pragma mark - 类名兼容 (照搬源码 VCamActionPatch.m 的 fallback)
 static Class VcamFix_BallClass(void) {
     Class c = NSClassFromString(@"Jx6");
-    if (c) return c;
-    return NSClassFromString(@"VCamFloatingBall");
+    return c ?: NSClassFromString(@"VCamFloatingBall");
 }
 static id VcamFix_BallInstance(void) {
     Class c = VcamFix_BallClass();
@@ -45,13 +40,11 @@ static id VcamFix_BallInstance(void) {
     SEL s = NSSelectorFromString(@"sharedInstance");
     if (![c respondsToSelector:s]) return nil;
     IMP f = [c methodForSelector:s];
-    if (!f) return nil;
-    return ((id(*)(id,SEL))f)(c, s);
+    return f ? ((id(*)(id,SEL))f)(c, s) : nil;
 }
 static Class VcamFix_CoreClass(void) {
     Class c = NSClassFromString(@"Qz1");
-    if (c) return c;
-    return NSClassFromString(@"VCamCore");
+    return c ?: NSClassFromString(@"VCamCore");
 }
 static id VcamFix_CoreInstance(void) {
     Class c = VcamFix_CoreClass();
@@ -59,8 +52,7 @@ static id VcamFix_CoreInstance(void) {
     SEL s = NSSelectorFromString(@"sharedInstance");
     if (![c respondsToSelector:s]) return nil;
     IMP f = [c methodForSelector:s];
-    if (!f) return nil;
-    return ((id(*)(id,SEL))f)(c, s);
+    return f ? ((id(*)(id,SEL))f)(c, s) : nil;
 }
 
 static NSString *VcamFix_PlistPath(void) { return @"/var/mobile/Media/DCIM/vc.plist"; }
@@ -73,21 +65,9 @@ static BOOL VcamFix_ReadEnabled(void) {
     return NO;
 }
 
-#pragma mark - 核心修复: swizzle VCamCore.setEnabled: 用 plist 真值调 orig
-
-static void (*gOrig_setEnabled)(id, SEL, BOOL) = NULL;
-
-static void VcamFix_setEnabled(id self, SEL _cmd, BOOL enabled) {
-    // polling 因 _licMark=NO 恒传 NO; 忽略入参, 一律用 plist 真值走源码分支
-    BOOL plistEn = VcamFix_ReadEnabled();
-    if (gOrig_setEnabled) gOrig_setEnabled(self, _cmd, plistEn);
-}
-
-#pragma mark - render 入口刷门禁 (防 polling 中途翻转导致 _licMark=NO)
-
-static void (*gOrig_renderPts)(id, SEL, CVPixelBufferRef, double) = NULL;
-
-static void VcamFix_renderPts(id self, SEL _cmd, CVPixelBufferRef pb, double pts) {
+#pragma mark - swizzle render: 每帧刷门禁
+static void (*gOrig_render)(id, SEL, CVPixelBufferRef, double) = NULL;
+static void VcamFix_render(id self, SEL _cmd, CVPixelBufferRef pb, double pts) {
     static Ivar ivG = NULL, ivM = NULL;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -100,49 +80,125 @@ static void VcamFix_renderPts(id self, SEL _cmd, CVPixelBufferRef pb, double pts
     uint8_t *b = (uint8_t *)(__bridge void *)self;
     if (ivG) *(BOOL *)(b + ivar_getOffset(ivG)) = YES;
     if (ivM) *(BOOL *)(b + ivar_getOffset(ivM)) = YES;
-    if (gOrig_renderPts) gOrig_renderPts(self, _cmd, pb, pts);
+    if (gOrig_render) gOrig_render(self, _cmd, pb, pts);
 }
 
-#pragma mark - 用户需求: 只禁用不启用
+#pragma mark - timer: 同步 plist.enabled -> VCamCore.setEnabled:
+// (源码 polling 因 _licMark=NO 恒算 effEnabled=NO, setEnabled: 永远不调)
+static void VcamFix_SyncEnabled(void) {
+    Class cls = VcamFix_CoreClass();
+    if (!cls) return;
+    id core = VcamFix_CoreInstance();
+    if (!core) return;
+    uint8_t *base = (uint8_t *)(__bridge void *)core;
+    Ivar ivMd = class_getInstanceVariable(cls, "_isMediaserverdProcess");
+    if (!ivMd) return;
+    if (!*(BOOL *)(base + ivar_getOffset(ivMd))) return;
 
-static void VcamFix_toggleReplacement(id self, SEL _cmd) {
-    if ([VCamNotify isPlistEnabled]) {
-        [VCamNotify setPlistEnabled:NO];
-        // runtime 调 VCamCore sharedInstance setEnabled:NO (不依赖头文件)
-        id core = VcamFix_CoreInstance();
-        if (core) {
-            SEL sSet = NSSelectorFromString(@"setEnabled:");
-            if ([core respondsToSelector:sSet]) {
-                IMP imp = [core methodForSelector:sSet];
-                if (imp) ((void(*)(id,SEL,BOOL))imp)(core, sSet, NO);
-            }
-        }
-        VcamFix_Log(@"[vcam][fix] toggle: disabled -> real camera");
-    } else {
-        VcamFix_Log(@"[vcam][fix] toggle: already disabled, noop");
-    }
-    SEL s = NSSelectorFromString(@"updateReplaceButtonVisual");
-    if ([self respondsToSelector:s]) {
-        ((void(*)(id,SEL))[self methodForSelector:s])(self, s);
-    }
+    Ivar ivG = class_getInstanceVariable(cls, "_licGate");
+    Ivar ivM = class_getInstanceVariable(cls, "_licMark");
+    if (ivG) *(BOOL *)(base + ivar_getOffset(ivG)) = YES;
+    if (ivM) *(BOOL *)(base + ivar_getOffset(ivM)) = YES;
+
+    Ivar ivEn = class_getInstanceVariable(cls, "_enabled");
+    if (!ivEn) return;
+    BOOL cur = *(BOOL *)(base + ivar_getOffset(ivEn));
+    BOOL plistEn = VcamFix_ReadEnabled();
+    if (cur == plistEn) return;
+
+    SEL s = NSSelectorFromString(@"setEnabled:");
+    if (![core respondsToSelector:s]) return;
+    IMP imp = [core methodForSelector:s];
+    if (!imp) return;
+    ((void(*)(id,SEL,BOOL))imp)(core, s, plistEn);
+    VcamFix_Log([NSString stringWithFormat:@"[vcam][fix] setEnabled:%d", (int)plistEn]);
 }
 
-#pragma mark - 用户需求: 按钮标题永远"禁用视频"
+#pragma mark - swizzle VCamActionPatch.actionTabTapped (照搬完整版逻辑, 去掉 lightPage 检查)
+static void VcamFix_actionTabTapped(id self, SEL _cmd) {
+    id ball = VcamFix_BallInstance();
+    if (!ball) return;
+    UIView *panelView = nil, *controlPage = nil;
+    UIButton *controlTab = nil;
+    @try { panelView = [ball valueForKey:@"panelView"]; } @catch (...) {}
+    @try { controlPage = [ball valueForKey:@"controlPageView"]; } @catch (...) {}
+    @try { controlTab = [ball valueForKey:@"tabControlBtn"]; } @catch (...) {}
+    if (!panelView || !controlPage) return;
 
-static void VcamFix_updateReplaceButtonVisual(id self, SEL _cmd) {
-    BOOL en = [VCamNotify isPlistEnabled];
-    id btn = nil;
-    @try { btn = [self valueForKey:@"replaceBtn"]; } @catch (...) {}
-    if (!btn) return;
-    [(UIButton *)btn setTitle:@"禁用视频" forState:UIControlStateNormal];
-    ((UIView *)btn).layer.borderWidth = 2;
-    ((UIView *)btn).layer.borderColor = en
-        ? [UIColor colorWithRed:0.30 green:0.85 blue:0.45 alpha:1.0].CGColor
-        : [UIColor clearColor].CGColor;
+    UIView *actionPage = [panelView viewWithTag:0x56435042];
+    UIButton *actionTab = [panelView viewWithTag:0x56435041];
+    if (!actionPage || !actionTab) return;
+
+    controlPage.hidden = YES;
+    actionPage.hidden = NO;
+
+    UIColor *inactive = [UIColor colorWithRed:0.32 green:0.33 blue:0.35 alpha:1.0];
+    UIColor *active   = [UIColor colorWithRed:0.58 green:0.59 blue:0.61 alpha:1.0];
+    if (controlTab) controlTab.backgroundColor = inactive;
+    actionTab.backgroundColor = active;
+
+    // 刷新状态标签 (源码 VCamActionPatch 的方法)
+    SEL s1 = NSSelectorFromString(@"refreshStatus");
+    if ([self respondsToSelector:s1]) ((void(*)(id,SEL))[self methodForSelector:s1])(self, s1);
+    SEL s2 = NSSelectorFromString(@"refreshDuration");
+    if ([self respondsToSelector:s2]) ((void(*)(id,SEL))[self methodForSelector:s2])(self, s2);
+
+    // 面板高度扩到 action 页底部
+    CGFloat pageTop = actionPage.frame.origin.y;
+    CGFloat contentH = actionPage.frame.size.height;
+    CGFloat targetH = pageTop + contentH + 10;
+    [UIView animateWithDuration:0.18 animations:^{
+        CGRect f = panelView.frame;
+        f.size.height = targetH;
+        panelView.frame = f;
+    }];
 }
 
-#pragma mark - VCamHidePatch 三指呼出 (照搬源码 hideBall/showBall, 只加类名 fallback)
+#pragma mark - 控制页 target 桥 (等价源码 VCamFloatingBall.controlTabTapped)
+@interface VcamFixCtrlTarget : NSObject
++ (instancetype)shared;
+- (void)onControlTabTapped:(id)sender;
+@end
 
+@implementation VcamFixCtrlTarget
++ (instancetype)shared {
+    static VcamFixCtrlTarget *inst = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ inst = [[VcamFixCtrlTarget alloc] init]; });
+    return inst;
+}
+
+- (void)onControlTabTapped:(id)sender {
+    id ball = VcamFix_BallInstance();
+    if (!ball) return;
+    UIView *panelView = nil, *controlPage = nil;
+    UIButton *ctrlBtn = nil;
+    @try { panelView = [ball valueForKey:@"panelView"]; } @catch (...) {}
+    @try { controlPage = [ball valueForKey:@"controlPageView"]; } @catch (...) {}
+    @try { ctrlBtn = [ball valueForKey:@"tabControlBtn"]; } @catch (...) {}
+    if (!panelView || !controlPage) return;
+
+    controlPage.hidden = NO;
+    UIView *actionPage = [panelView viewWithTag:0x56435042];
+    if (actionPage) actionPage.hidden = YES;
+
+    UIButton *actBtn = [panelView viewWithTag:0x56435041];
+    UIColor *inactive = [UIColor colorWithRed:0.32 green:0.33 blue:0.35 alpha:1.0];
+    UIColor *active   = [UIColor colorWithRed:0.58 green:0.59 blue:0.61 alpha:1.0];
+    if (ctrlBtn) ctrlBtn.backgroundColor = active;
+    if (actBtn)  actBtn.backgroundColor  = inactive;
+
+    // 恢复 panelView 高度 (等价源码 applyPanelContentHeight:)
+    CGFloat targetH = controlPage.frame.origin.y + controlPage.frame.size.height + 10;
+    [UIView animateWithDuration:0.18 animations:^{
+        CGRect f = panelView.frame;
+        f.size.height = targetH;
+        panelView.frame = f;
+    }];
+}
+@end
+
+#pragma mark - VCamHidePatch 三处 (照搬源码, 只加类名 fallback)
 static void VcamFix_hideBall(Class self, SEL _cmd) {
     @try {
         NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:VcamFix_PlistPath()];
@@ -176,8 +232,6 @@ static void VcamFix_showBall(Class self, SEL _cmd) {
     } @catch (...) {}
 }
 
-#pragma mark - hideBtn 位置 (照搬源码位置算法, 精简版布局下放末行下方)
-
 static void VcamFix_pollHide(Class self, SEL _cmd) {
     static BOOL injected = NO;
     if (injected) return;
@@ -188,6 +242,7 @@ static void VcamFix_pollHide(Class self, SEL _cmd) {
     if (!cpv) return;
     if ([cpv viewWithTag:0x56434D31]) { injected = YES; return; }
 
+    // 找末行底部 (不覆盖 −/+)
     CGFloat maxBottom = -1, cellH = 0;
     for (UIView *sub in cpv.subviews) {
         if (![sub isKindOfClass:[UIButton class]]) continue;
@@ -205,8 +260,7 @@ static void VcamFix_pollHide(Class self, SEL _cmd) {
     hb.backgroundColor = [UIColor colorWithRed:0.42 green:0.43 blue:0.45 alpha:1.0];
     hb.layer.cornerRadius = 9;
     hb.layer.masksToBounds = YES;
-    UIImageSymbolConfiguration *cfg =
-        [UIImageSymbolConfiguration configurationWithPointSize:14 weight:UIImageSymbolWeightSemibold];
+    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14 weight:UIImageSymbolWeightSemibold];
     UIImage *sym = [UIImage systemImageNamed:@"eye.slash.fill" withConfiguration:cfg];
     if (sym) {
         [hb setImage:sym forState:UIControlStateNormal];
@@ -217,8 +271,7 @@ static void VcamFix_pollHide(Class self, SEL _cmd) {
         [hb setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         hb.titleLabel.font = [UIFont boldSystemFontOfSize:16];
     }
-    [hb addTarget:self action:NSSelectorFromString(@"vchp_hideTapped")
-        forControlEvents:UIControlEventTouchUpInside];
+    [hb addTarget:self action:NSSelectorFromString(@"vchp_hideTapped") forControlEvents:UIControlEventTouchUpInside];
     [cpv addSubview:hb];
 
     CGRect cf = cpv.frame;
@@ -236,8 +289,58 @@ static void VcamFix_pollHide(Class self, SEL _cmd) {
     injected = YES;
 }
 
-#pragma mark - 入口
+#pragma mark - 只禁用不启用
+static void VcamFix_toggleReplacement(id self, SEL _cmd) {
+    if ([VCamNotify isPlistEnabled]) {
+        [VCamNotify setPlistEnabled:NO];
+        id core = VcamFix_CoreInstance();
+        if (core) {
+            SEL s = NSSelectorFromString(@"setEnabled:");
+            if ([core respondsToSelector:s]) {
+                IMP imp = [core methodForSelector:s];
+                if (imp) ((void(*)(id,SEL,BOOL))imp)(core, s, NO);
+            }
+        }
+        VcamFix_Log(@"[vcam][fix] toggle: disabled");
+    } else {
+        VcamFix_Log(@"[vcam][fix] toggle: noop");
+    }
+    SEL s = NSSelectorFromString(@"updateReplaceButtonVisual");
+    if ([self respondsToSelector:s]) ((void(*)(id,SEL))[self methodForSelector:s])(self, s);
+}
 
+static void VcamFix_updateReplaceButtonVisual(id self, SEL _cmd) {
+    BOOL en = [VCamNotify isPlistEnabled];
+    id btn = nil;
+    @try { btn = [self valueForKey:@"replaceBtn"]; } @catch (...) {}
+    if (!btn) return;
+    [(UIButton *)btn setTitle:@"禁用视频" forState:UIControlStateNormal];
+    ((UIView *)btn).layer.borderWidth = 2;
+    ((UIView *)btn).layer.borderColor = en
+        ? [UIColor colorWithRed:0.30 green:0.85 blue:0.45 alpha:1.0].CGColor
+        : [UIColor clearColor].CGColor;
+}
+
+#pragma mark - 给 tabControlBtn 追加 target (轮询式, panelView 就绪后)
+static void VcamFix_ensureControlTabTarget(void) {
+    id ball = VcamFix_BallInstance();
+    if (!ball) return;
+    UIButton *ctrlBtn = nil;
+    @try { ctrlBtn = [ball valueForKey:@"tabControlBtn"]; } @catch (...) {}
+    if (!ctrlBtn) return;
+    BOOL has = NO;
+    for (id t in [ctrlBtn allTargets]) {
+        if ([t isKindOfClass:[VcamFixCtrlTarget class]]) { has = YES; break; }
+    }
+    if (!has) {
+        [ctrlBtn addTarget:[VcamFixCtrlTarget shared]
+                    action:@selector(onControlTabTapped:)
+          forControlEvents:UIControlEventTouchUpInside];
+        VcamFix_Log(@"[vcam][fix] controlTab addTarget OK");
+    }
+}
+
+#pragma mark - 入口
 __attribute__((constructor, used))
 static void VcamFixInit(void) {
     @autoreleasepool {
@@ -251,18 +354,23 @@ static void VcamFixInit(void) {
             if (coreCls) {
                 Method mr = class_getInstanceMethod(coreCls, NSSelectorFromString(@"renderReplacementToPixelBuffer:pts:"));
                 if (mr) {
-                    gOrig_renderPts = (void (*)(id,SEL,CVPixelBufferRef,double))method_getImplementation(mr);
-                    method_setImplementation(mr, (IMP)VcamFix_renderPts);
-                }
-                Method ms = class_getInstanceMethod(coreCls, NSSelectorFromString(@"setEnabled:"));
-                if (ms) {
-                    gOrig_setEnabled = (void (*)(id,SEL,BOOL))method_getImplementation(ms);
-                    method_setImplementation(ms, (IMP)VcamFix_setEnabled);
+                    gOrig_render = (void (*)(id,SEL,CVPixelBufferRef,double))method_getImplementation(mr);
+                    method_setImplementation(mr, (IMP)VcamFix_render);
                 }
             }
-            VcamFix_Log(@"[vcam][fix] md: setEnabled swizzled (plist 真值)");
+            dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+            gTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+            dispatch_source_set_timer(gTimer,
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+                (uint64_t)(0.1 * NSEC_PER_SEC), (uint64_t)(0.02 * NSEC_PER_SEC));
+            dispatch_source_set_event_handler(gTimer, ^{
+                @autoreleasepool { VcamFix_SyncEnabled(); }
+            });
+            dispatch_resume(gTimer);
+            VcamFix_Log(@"[vcam][fix] md init");
 
         } else if (isSB) {
+            // 只禁用不启用 + 标题固定
             Class ballCls = VcamFix_BallClass();
             if (ballCls) {
                 Method mt = class_getInstanceMethod(ballCls, NSSelectorFromString(@"toggleReplacementTapped"));
@@ -270,7 +378,13 @@ static void VcamFixInit(void) {
                 Method mu = class_getInstanceMethod(ballCls, NSSelectorFromString(@"updateReplaceButtonVisual"));
                 if (mu) method_setImplementation(mu, (IMP)VcamFix_updateReplaceButtonVisual);
             }
-
+            // 动作 tab 切换 (照搬完整版逻辑)
+            Class actCls = NSClassFromString(@"VCamActionPatch");
+            if (actCls) {
+                Method m = class_getInstanceMethod(actCls, NSSelectorFromString(@"actionTabTapped"));
+                if (m) method_setImplementation(m, (IMP)VcamFix_actionTabTapped);
+            }
+            // VCamHidePatch
             Class hideCls = NSClassFromString(@"VCamHidePatch");
             if (hideCls) {
                 Method m1 = class_getClassMethod(hideCls, NSSelectorFromString(@"hideBall"));
@@ -280,19 +394,20 @@ static void VcamFixInit(void) {
                 Method m3 = class_getClassMethod(hideCls, NSSelectorFromString(@"pollForPanelAndInjectButton"));
                 if (m3) method_setImplementation(m3, (IMP)VcamFix_pollHide);
             }
-
-            // SpringBoard 里也 swizzle setEnabled (lean VCamCore 只写 _enabled)
-            Class coreCls = VcamFix_CoreClass();
-            if (coreCls) {
-                Method ms = class_getInstanceMethod(coreCls, NSSelectorFromString(@"setEnabled:"));
-                if (ms) {
-                    if (!gOrig_setEnabled) {
-                        gOrig_setEnabled = (void (*)(id,SEL,BOOL))method_getImplementation(ms);
-                    }
-                    method_setImplementation(ms, (IMP)VcamFix_setEnabled);
-                }
-            }
-            VcamFix_Log(@"[vcam][fix] sb: toggle/updateBtn/hidePatch swizzled");
+            // tabControlBtn 追加 target
+            dispatch_queue_t q = dispatch_get_main_queue();
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), q, ^{
+                VcamFix_ensureControlTabTarget();
+            });
+            dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+            dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                                      (uint64_t)(1.0 * NSEC_PER_SEC), (uint64_t)(0.2 * NSEC_PER_SEC));
+            dispatch_source_set_event_handler(t, ^{
+                @autoreleasepool { VcamFix_ensureControlTabTarget(); }
+            });
+            dispatch_resume(t);
+            static dispatch_source_t sKeep = nil; sKeep = t;
+            VcamFix_Log(@"[vcam][fix] sb init");
         }
     }
 }
