@@ -44,7 +44,11 @@ static NSString *vcam_process_cpu_seconds(void) {
     return [NSString stringWithFormat:@"%.1f", total];
 }
 
+// 遥测采样（记录内存 + CPU%，值暂时未打印，保留供后续启用）
 static void vcam_telemetry_sample(uint64_t renderedFrames, NSString *streamStats) {
+    (void)renderedFrames;
+    (void)streamStats;
+
     static CFAbsoluteTime lastTel = 0;
     static double lastCpu = 0;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -52,13 +56,18 @@ static void vcam_telemetry_sample(uint64_t renderedFrames, NSString *streamStats
 
     task_vm_info_data_t vmInfo;
     mach_msg_type_number_t vmCount = TASK_VM_INFO_COUNT;
-    uint64_t footprint = 0, resident = 0;
+    uint64_t footprint = 0;
+    uint64_t resident = 0;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmInfo, &vmCount) == KERN_SUCCESS) {
         footprint = vmInfo.phys_footprint;
         resident = vmInfo.resident_size;
     }
+    (void)footprint;
+    (void)resident;
+
     double cpuSec = [vcam_process_cpu_seconds() doubleValue];
     double cpuPct = (lastTel > 0 && now > lastTel) ? ((cpuSec - lastCpu) / (now - lastTel) * 100.0) : 0;
+    (void)cpuPct;
     lastTel = now;
     lastCpu = cpuSec;
 }
@@ -78,7 +87,6 @@ static BOOL vcam_log_enabled(void) {
     return cached == 1;
 }
 
-// 令牌桶：容量 24，持续 3 行/s（12KB/s，恰在磁盘配额内）
 BOOL vcam_log_budget_take(void) {
     static NSLock *lk = nil;
     static double tokens = 24.0;
@@ -308,7 +316,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         _lastProcessedFormat = 0;
         _prerenderActive = NO;
 
-        // SpringBoard 轻量版
         if ([[[NSProcessInfo processInfo] processName] isEqualToString:@"SpringBoard"]) {
             _gpuProcessor = nil;
             _videoPlayer = nil;
@@ -467,7 +474,7 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             self.lowPowerDecode = lowPower;
         }
 
-        // 不可见流节流（低功率档窗口）
+        // 不可见流节流
         {
             uint64_t px = (uint64_t)targetW * targetH;
             double window = px > 10000000ull ? 1.0 : (lowPower ? 0.05 : 0.0);
@@ -491,13 +498,11 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
 
     static int vcamRenderCount = 0;
     vcamRenderCount++;
-    BOOL diagThisFrame = (vcamRenderCount % 600 == 1);
+    (void)vcamRenderCount;
 
-    // 渲染主体全局串行化
     [_renderLock lock];
 
     if (!yuv) {
-        // 无帧回退
         CVPixelBufferRef fb = _fallbackFrame;
         if (fb) CVPixelBufferRetain(fb);
         if (fb) {
@@ -509,14 +514,11 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
     }
 
     CVPixelBufferRef base = yuv;
-
-    // 自适应旋转
     CVPixelBufferRef src = [_gpuProcessor adaptiveRotateIfNeeded:base
                                                      targetWidth:targetW
                                                     targetHeight:targetH
                                                            token:gen];
 
-    BOOL usedFallbackSource = NO;
     BOOL ok = [self writeFrame:src toPixelBuffer:pixelBuffer token:gen];
     if (!ok && base == yuv) {
         if (src) CVPixelBufferRelease(src);
@@ -530,7 +532,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             CVPixelBufferRelease(lazyBGRA);
         }
         ok = [self writeFrame:src toPixelBuffer:pixelBuffer token:0];
-        usedFallbackSource = ok;
     }
     if (ok) {
         _frameCount++;
@@ -644,7 +645,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         if (!strongSelf) return;
 
         CFAbsoluteTime nextTick = CFAbsoluteTimeGetCurrent();
-        uint64_t renderedFrames = 0;
 
         while (strongSelf.prerenderActive && strongSelf.enabled) {
             @autoreleasepool {
@@ -663,7 +663,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                     nextTick = CFAbsoluteTimeGetCurrent();
                 }
 
-                // 消费式取帧 + 短等待（双时钟拍频）
                 CVPixelBufferRef frame = [strongSelf.videoPlayer.frameQueue dequeuePixelBuffer];
                 if (!frame) {
                     CFAbsoluteTime waitStart = CFAbsoluteTimeGetCurrent();
@@ -674,7 +673,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                     }
                 }
                 if (frame) {
-                    // FIFO + 突发限深
                     while ([strongSelf.videoPlayer.frameQueue count] > 1) {
                         CVPixelBufferRef excess = [strongSelf.videoPlayer.frameQueue dequeuePixelBuffer];
                         if (excess) CVPixelBufferRelease(excess);
@@ -683,7 +681,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 if (!frame) frame = [strongSelf.videoPlayer copyCurrentFrame];
                 if (!frame) continue;
 
-                // 重复源跳过
                 strongSelf.gpuProcessor.sourceRotation = strongSelf.videoPlayer.preferredRotation;
                 int curRot = (strongSelf.gpuProcessor.sourceRotation + strongSelf.gpuProcessor.rotationAngle) % 360;
                 BOOL curMirror = strongSelf.gpuProcessor.mirrored;
@@ -707,17 +704,14 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 strongSelf->_lastPrerenderPanY = curPanY;
                 strongSelf->_lastPrerenderZoom = curZoom;
 
-                // 1. 旋转/镜像
                 CVPixelBufferRef rotated = [strongSelf.gpuProcessor rotateAndMirrorIfNeeded:frame];
                 CVPixelBufferRelease(frame);
                 if (!rotated) continue;
 
-                // 2. 用户画面变换（缩放/平移烘焙）
                 CVPixelBufferRef baked = [strongSelf.gpuProcessor bakeUserTransformIntoCanvas:rotated];
                 CVPixelBufferRelease(rotated);
                 if (!baked) continue;
 
-                // 3. 替换 live 缓存
                 [strongSelf.processLock lock];
                 if (strongSelf->_liveYUVPixelBuffer) {
                     CVPixelBufferRelease(strongSelf->_liveYUVPixelBuffer);
@@ -725,8 +719,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 strongSelf->_liveYUVPixelBuffer = baked;
                 strongSelf->_liveFrameGen++;
                 [strongSelf.processLock unlock];
-
-                renderedFrames++;
             }
         }
     });
@@ -809,7 +801,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             [strongSelf setEnabled:effEnabled];
         }
 
-        // 空闲看门狗分级
         if (strongSelf.isMediaserverdProcess && strongSelf.enabled && !strongSelf.pipelineIdle &&
             strongSelf->_lastRenderActivity > 0 &&
             (CFAbsoluteTimeGetCurrent() - strongSelf->_lastRenderActivity) > 2.0 &&
@@ -818,7 +809,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             [strongSelf->_videoPlayer stopDecodingThread];
         }
 
-        // 深度空闲 60s 卸载
         if (strongSelf.isMediaserverdProcess && strongSelf.enabled && strongSelf.pipelineIdle &&
             strongSelf->_lastRenderActivity > 0 &&
             (CFAbsoluteTimeGetCurrent() - strongSelf->_lastRenderActivity) > 60.0) {
@@ -844,7 +834,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             }
         }
 
-        // 资源遥测
         if (strongSelf.isMediaserverdProcess) {
             static CFAbsoluteTime lastStatsTake = 0;
             CFAbsoluteTime nowStats = CFAbsoluteTimeGetCurrent();
@@ -855,10 +844,8 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             }
         }
 
-        // 读 plist 配置
         NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{};
 
-        // 旋转/镜像
         static NSInteger lastSyncedRotation = -1;
         static BOOL lastSyncedMirrored = NO;
         NSInteger plistRotation = [pl[@"manualRotation"] integerValue];
@@ -872,7 +859,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             lastSyncedMirrored = plistMirrored;
         }
 
-        // 用户画面变换
         static double lastSyncedPanX = 0.0;
         static double lastSyncedPanY = 0.0;
         static double lastSyncedZoom = -1.0;
@@ -892,7 +878,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             lastSyncedZoom = plistZoom;
         }
 
-        // 视频源切换
         static NSString *lastSyncedPath = nil;
         static BOOL pathSyncInit = NO;
         NSString *activePath = pl[@"activePlaybackPath"];
@@ -924,7 +909,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             pathSyncInit = YES;
         }
 
-        // 暂停/继续
         static BOOL lastSyncedPaused = NO;
         BOOL plistPaused = [pl[@"paused"] boolValue];
         if (plistPaused != lastSyncedPaused) {
@@ -932,7 +916,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             lastSyncedPaused = plistPaused;
         }
 
-        // 从头重播
         static NSInteger lastRestartToken = -1;
         NSInteger restartToken = [pl[@"restartToken"] integerValue];
         if (restartToken != lastRestartToken) {
