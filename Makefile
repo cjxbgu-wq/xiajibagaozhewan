@@ -17,9 +17,9 @@ VcamMax_FILES = \
     FixActionPlayback.m \
     VCamHidePatch.m
 
-VcamMax_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function
+VcamMax_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-unguarded-availability-new
 
-VcamMax_FRAMEWORKS = UIKit Foundation AVFoundation CoreMedia CoreVideo CoreImage CoreGraphics
+VcamMax_FRAMEWORKS = UIKit Foundation AVFoundation CoreMedia CoreVideo CoreImage CoreGraphics VideoToolbox
 VcamMax_PRIVATE_FRAMEWORKS =
 VcamMax_LIBRARIES =
 
