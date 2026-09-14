@@ -1,15 +1,13 @@
 //
 //  VcamFix.m — 对精简版源码的运行时补丁（源码零更改）
 //
-//  修复:
-//  1. 视频静止不播放 —— polling 因 _licMark=NO 把 setEnabled:NO 覆盖, 预渲染线程
-//     退出且 _prerenderActive 卡 YES, 再也起不来。swizzle setEnabled: 拦截与
-//     plist 不一致的调用, 让源码 setEnabled: 分支只在 plist 真值下执行
-//  2. 点 + 键面板消失 / 隐藏按钮失效 —— VCamHidePatch 把 hideBtn 覆盖到 + 按钮
-//     位置, 且找不到类名。swizzle VCamHidePatch.pollForPanelAndInjectButton 为
-//     空实现阻止它注入, 本补丁自己注入 hideBtn 到独立行
-//  3. 功能按钮缺失 —— 补 复/←↑→↓/镜/▶ (只补完整版原有按钮, 无自造功能)
-//  4. 动作按钮 —— VCamActionPatch 已有完整逻辑, 本补丁仅在未注入时兜底
+//  仅修复用户提出的 4 个问题:
+//  1. 视频静止不播放
+//  2. 点 + 键面板消失（hideBtn 覆盖在 + 上导致）
+//  3. 隐藏按钮失效
+//  4. 动作按钮失效
+//
+//  不新增任何功能按钮, 不动 −/+/旋转/禁用视频 现有布局
 //
 //  用法: 在 Makefile 的 VcamMax_FILES 里追加 VcamFix.m 即可
 //
@@ -27,12 +25,11 @@
 static dispatch_source_t gVcamFixUITimer      = nil;
 static dispatch_source_t gVcamFixEnabledTimer = nil;
 
-#pragma mark - Tag 常量
+#pragma mark - Tag 常量（与源码一致）
 
-static const NSInteger kTagHideBtn     = 0x56434D31;   // 与 VCamHidePatch 一致
-static const NSInteger kTagActionTab   = 0x56435041;
-static const NSInteger kTagActionPage  = 0x56435042;
-static const NSInteger kTagFuncBtnBase = 0x46583000;
+static const NSInteger kTagHideBtn    = 0x56434D31;
+static const NSInteger kTagActionTab  = 0x56435041;
+static const NSInteger kTagActionPage = 0x56435042;
 
 #pragma mark - 日志
 
@@ -123,46 +120,83 @@ static void VcamFix_renderPts(id self, SEL _cmd, CVPixelBufferRef pb, double pts
     if (gOrig_renderPts) gOrig_renderPts(self, _cmd, pb, pts);
 }
 
-#pragma mark - swizzle: setEnabled 参数与 plist 不一致时拦截
+#pragma mark - swizzle: setEnabled 与 plist 不一致时拦截
 
 static void (*gOrig_setEnabled)(id, SEL, BOOL) = NULL;
 
 static void VcamFix_setEnabled(id self, SEL _cmd, BOOL enabled) {
     BOOL plistEn = VcamFix_ReadPlistEnabled();
     if (enabled != plistEn) {
-        VcamFix_Log([NSString stringWithFormat:
-            @"[vcam][fix] setEnabled:%d BLOCKED (plist=%d)", enabled, plistEn]);
+        // polling 因 _licMark=NO 恒传 NO, 拦截, 让 _enabled 只由 plist 决定
         return;
     }
     if (gOrig_setEnabled) gOrig_setEnabled(self, _cmd, enabled);
 }
 
-#pragma mark - 0.1s timer: plist 与 _enabled 差异 -> 调 setEnabled: 同步
+#pragma mark - 问题 1 核心: 0.1s timer 完整同步状态
 
 static void VcamFix_SyncEnabled(void) {
     Class cls = VcamFix_CoreClass();
     if (!cls) return;
     id core = VcamFix_CoreInstance();
     if (!core) return;
+
+    uint8_t *base = (uint8_t *)(__bridge void *)core;
+
+    // 修复: 未进入 mediaserverd 初始化前不操作, 否则 setEnabled 会走
+    // "if (!_isMediaserverdProcess) { _enabled = enabled; return; }" 分支,
+    // 导致 _enabled=YES 但 _prerenderActive=NO 卡死 (视频静止直接根因)
+    Ivar ivMd = class_getInstanceVariable(cls, "_isMediaserverdProcess");
+    if (ivMd) {
+        BOOL isMd = *(BOOL *)(base + ivar_getOffset(ivMd));
+        if (!isMd) return;  // 等下一拍
+    } else {
+        return;
+    }
+
     Ivar ivEn = class_getInstanceVariable(cls, "_enabled");
     if (!ivEn) return;
-    uint8_t *base = (uint8_t *)(__bridge void *)core;
     BOOL cur = *(BOOL *)(base + ivar_getOffset(ivEn));
     BOOL plistEn = VcamFix_ReadPlistEnabled();
-    if (cur == plistEn) return;
-    SEL sSet = NSSelectorFromString(@"setEnabled:");
-    if (![core respondsToSelector:sSet]) return;
-    IMP imp = [core methodForSelector:sSet];
-    if (!imp) return;
-    ((void (*)(id, SEL, BOOL))imp)(core, sSet, plistEn);
-    VcamFix_Log([NSString stringWithFormat:
-        @"[vcam][fix] enabled sync %d -> %d", cur, plistEn]);
-}
 
-#pragma mark - swizzle: VCamHidePatch.pollForPanelAndInjectButton -> 空
+    // (a) plist 与 _enabled 不一致 -> 走源码 setEnabled: 分支
+    if (cur != plistEn) {
+        SEL sSet = NSSelectorFromString(@"setEnabled:");
+        if ([core respondsToSelector:sSet]) {
+            IMP imp = [core methodForSelector:sSet];
+            if (imp) {
+                ((void (*)(id, SEL, BOOL))imp)(core, sSet, plistEn);
+                VcamFix_Log([NSString stringWithFormat:
+                    @"[vcam][fix] enabled sync %d -> %d", cur, plistEn]);
+            }
+        }
+    }
 
-static void VcamFix_pollHideStub(id self, SEL _cmd) {
-    // 空实现: 阻止 VCamHidePatch 把 hideBtn 覆盖到 "+" 按钮位置
+    // (b) 兜底: _enabled=YES 但 _prerenderActive=NO -> 主动重启预渲染+解码
+    //     (处理早期 timer 抢跑导致 setEnabled:YES 未启预渲染的卡死)
+    if (plistEn) {
+        Ivar ivPre = class_getInstanceVariable(cls, "_prerenderActive");
+        if (ivPre) {
+            BOOL pre = *(BOOL *)(base + ivar_getOffset(ivPre));
+            BOOL en  = *(BOOL *)(base + ivar_getOffset(ivEn));
+            if (en && !pre) {
+                SEL sStart = NSSelectorFromString(@"startPrerenderThread");
+                if ([core respondsToSelector:sStart]) {
+                    ((void(*)(id,SEL))[core methodForSelector:sStart])(core, sStart);
+                    VcamFix_Log(@"[vcam][fix] restart prerender thread (was dead)");
+                }
+                id player = nil;
+                @try { player = [core valueForKey:@"videoPlayer"]; } @catch (...) {}
+                if (player) {
+                    SEL sDecode = NSSelectorFromString(@"startDecodingThread");
+                    if ([player respondsToSelector:sDecode]) {
+                        ((void(*)(id,SEL))[player methodForSelector:sDecode])(player, sDecode);
+                        VcamFix_Log(@"[vcam][fix] restart decoding thread");
+                    }
+                }
+            }
+        }
+    }
 }
 
 #pragma mark - 控制页 target 桥
@@ -172,13 +206,6 @@ static void VcamFix_pollHideStub(id self, SEL _cmd) {
 - (void)onControlTabTapped:(id)sender;
 - (void)onActionTabTapped:(id)sender;
 - (void)onHideTapped:(id)sender;
-- (void)onResetTransformTapped:(id)sender;
-- (void)onPanUpTapped:(id)sender;
-- (void)onPanDownTapped:(id)sender;
-- (void)onPanLeftTapped:(id)sender;
-- (void)onPanRightTapped:(id)sender;
-- (void)onMirrorTapped:(id)sender;
-- (void)onPlayPauseTapped:(id)sender;
 - (void)onBlinkTapped:(id)sender;
 - (void)onMouthTapped:(id)sender;
 - (void)onHeadTapped:(id)sender;
@@ -236,6 +263,7 @@ static void VcamFix_pollHideStub(id self, SEL _cmd) {
     if (actBtn)  actBtn.backgroundColor  = active;
 }
 
+// 问题 3: 隐藏按钮逻辑 (对齐 VCamHidePatch.m 的 hideBall + activateThreeFingerWindow)
 - (void)onHideTapped:(id)sender {
     @try {
         NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:VcamFix_PlistPath()];
@@ -243,6 +271,7 @@ static void VcamFix_pollHideStub(id self, SEL _cmd) {
         d[@"ballHidden"] = @YES;
         [d writeToFile:VcamFix_PlistPath() atomically:YES];
     } @catch (...) {}
+
     id ball = VcamFix_BallInstance();
     if (ball) {
         @try {
@@ -263,35 +292,7 @@ static void VcamFix_pollHideStub(id self, SEL _cmd) {
     VcamFix_Log(@"[vcam][fix] hide button tapped");
 }
 
-- (void)onResetTransformTapped:(id)sender {
-    [VCamNotify resetPlistTransform];
-    VcamFix_Log(@"[vcam][fix] btn 复");
-}
-- (void)onPanUpTapped:(id)sender {
-    double ny = [VCamNotify plistPanY] - 0.05; if (ny < -1.0) ny = -1.0;
-    [VCamNotify setPlistPanY:ny];
-}
-- (void)onPanDownTapped:(id)sender {
-    double ny = [VCamNotify plistPanY] + 0.05; if (ny > 1.0) ny = 1.0;
-    [VCamNotify setPlistPanY:ny];
-}
-- (void)onPanLeftTapped:(id)sender {
-    double nx = [VCamNotify plistPanX] - 0.05; if (nx < -1.0) nx = -1.0;
-    [VCamNotify setPlistPanX:nx];
-}
-- (void)onPanRightTapped:(id)sender {
-    double nx = [VCamNotify plistPanX] + 0.05; if (nx > 1.0) nx = 1.0;
-    [VCamNotify setPlistPanX:nx];
-}
-- (void)onMirrorTapped:(id)sender {
-    BOOL m = ![VCamNotify plistMirrored];
-    [VCamNotify setPlistMirrored:m];
-}
-- (void)onPlayPauseTapped:(id)sender {
-    BOOL p = ![VCamNotify plistPaused];
-    [VCamNotify setPlistPaused:p];
-}
-
+// 问题 4: 动作按钮逻辑 (优先调源码 VCamActionPatch.doAction:, 否则直写 plist)
 - (void)doAction:(int)action {
     Class cls = NSClassFromString(@"VCamActionPatch");
     if (cls) {
@@ -375,7 +376,7 @@ static UIButton *VcamFix_MakeBtn(NSString *title, CGRect frame, NSInteger tag,
     return b;
 }
 
-#pragma mark - 调源码 updatePanelPosition（改 panelView 高度后重定位）
+#pragma mark - 调源码 updatePanelPosition（改 panelView.frame 后重定位）
 
 static void VcamFix_CallUpdatePanelPosition(id ball) {
     if (!ball) return;
@@ -405,8 +406,6 @@ static void VcamFix_PatchUI(void) {
     CGFloat contentW = panelW - pad * 2;
     CGFloat colGap = 8;
     CGFloat colW3 = (contentW - colGap * 2) / 3.0;
-    CGFloat cellH = 52;
-    CGFloat gap = 8;
     CGFloat tabW = ctrlBtn.frame.size.width;
     CGFloat tabH = ctrlBtn.frame.size.height;
     CGFloat tabY = ctrlBtn.frame.origin.y;
@@ -424,60 +423,27 @@ static void VcamFix_PatchUI(void) {
         VcamFix_Log(@"[vcam][fix] tabControlBtn addTarget OK");
     }
 
-    // ===== 2. 功能按钮 (复/←↑→↓/镜/▶) =====
-    if ([controlPage viewWithTag:kTagFuncBtnBase] == nil) {
-        CGFloat baseY = 158;
-        CGFloat y4 = baseY + gap;
-        CGFloat y5 = y4 + cellH + gap;
-        CGFloat y6 = y5 + cellH + gap;
-
-        [controlPage addSubview:VcamFix_MakeBtn(@"←",
-            CGRectMake(pad, y4, colW3, cellH), kTagFuncBtnBase + 1,
-            @selector(onPanLeftTapped:), 20)];
-        [controlPage addSubview:VcamFix_MakeBtn(@"↑",
-            CGRectMake(pad + colW3 + colGap, y4, colW3, cellH), kTagFuncBtnBase + 2,
-            @selector(onPanUpTapped:), 20)];
-        [controlPage addSubview:VcamFix_MakeBtn(@"→",
-            CGRectMake(pad + (colW3 + colGap) * 2, y4, colW3, cellH), kTagFuncBtnBase + 3,
-            @selector(onPanRightTapped:), 20)];
-        [controlPage addSubview:VcamFix_MakeBtn(@"↓",
-            CGRectMake(pad, y5, colW3, cellH), kTagFuncBtnBase + 4,
-            @selector(onPanDownTapped:), 20)];
-        [controlPage addSubview:VcamFix_MakeBtn(@"▶",
-            CGRectMake(pad + colW3 + colGap, y5, colW3, cellH), kTagFuncBtnBase + 5,
-            @selector(onPlayPauseTapped:), 20)];
-        [controlPage addSubview:VcamFix_MakeBtn(@"镜",
-            CGRectMake(pad + (colW3 + colGap) * 2, y5, colW3, cellH), kTagFuncBtnBase + 6,
-            @selector(onMirrorTapped:), 20)];
-        [controlPage addSubview:VcamFix_MakeBtn(@"复",
-            CGRectMake(pad, y6, contentW, cellH), kTagFuncBtnBase + 7,
-            @selector(onResetTransformTapped:), 18)];
-
-        controlPage.frame = CGRectMake(controlPage.frame.origin.x,
-                                       controlPage.frame.origin.y,
-                                       controlPage.frame.size.width,
-                                       y6 + cellH);   // 338
-        panelView.frame = CGRectMake(panelView.frame.origin.x,
-                                     panelView.frame.origin.y,
-                                     panelView.frame.size.width,
-                                     pageTop + 338 + pad);
-        VcamFix_CallUpdatePanelPosition(ball);
-        VcamFix_Log(@"[vcam][fix] functional buttons injected");
-    }
-
-    // 刷新 ▶/⏸
-    UIButton *playBtn = (UIButton *)[controlPage viewWithTag:kTagFuncBtnBase + 5];
-    if (playBtn) {
-        BOOL paused = [VCamNotify plistPaused];
-        NSString *want = paused ? @"▶" : @"⏸";
-        if (![[playBtn titleForState:UIControlStateNormal] isEqualToString:want]) {
-            [playBtn setTitle:want forState:UIControlStateNormal];
+    // ===== 2. 问题 2: 清理旧版 VcamFix 覆盖在 + 上的 hideBtn =====
+    UIButton *oldHide = (UIButton *)[controlPage viewWithTag:kTagHideBtn];
+    if (oldHide) {
+        BOOL conflicts = NO;
+        for (UIView *sub in controlPage.subviews) {
+            if (sub == oldHide) continue;
+            if (![sub isKindOfClass:[UIButton class]]) continue;
+            if (CGRectIntersectsRect(sub.frame, oldHide.frame)) {
+                conflicts = YES;
+                break;
+            }
+        }
+        if (conflicts) {
+            [oldHide removeFromSuperview];
+            VcamFix_Log(@"[vcam][fix] removed misplaced old hide button (overlapping +)");
         }
     }
 
-    // ===== 3. 隐藏按钮 (独立行, 位于功能按钮之后) =====
+    // ===== 3. 问题 3: 隐藏按钮 (独立行 y=166, 不覆盖 −/+) =====
     if (![controlPage viewWithTag:kTagHideBtn]) {
-        CGFloat hideY = 338 + gap;   // 346
+        CGFloat hideY = 158 + 8;   // 现有 3 行底部 = 158
         UIButton *hideBtn = [UIButton buttonWithType:UIButtonTypeSystem];
         hideBtn.tag = kTagHideBtn;
         hideBtn.frame = CGRectMake(pad, hideY, contentW, 34);
@@ -505,17 +471,31 @@ static void VcamFix_PatchUI(void) {
         controlPage.frame = CGRectMake(controlPage.frame.origin.x,
                                        controlPage.frame.origin.y,
                                        controlPage.frame.size.width,
-                                       346 + 34);   // 380
+                                       hideY + 34);
         panelView.frame = CGRectMake(panelView.frame.origin.x,
                                      panelView.frame.origin.y,
                                      panelView.frame.size.width,
-                                     pageTop + 380 + pad);
+                                     pageTop + (hideY + 34) + pad);
         VcamFix_CallUpdatePanelPosition(ball);
-        VcamFix_Log(@"[vcam][fix] hide button injected");
+        VcamFix_Log(@"[vcam][fix] hide button injected at y=166");
     }
 
-    // ===== 4. 动作 tab + 动作页 (VCamActionPatch 未注入时兜底) =====
-    if (![panelView viewWithTag:kTagActionTab]) {
+    // ===== 4. 问题 4: 动作 tab + 动作页 =====
+    UIButton *actTab = (UIButton *)[panelView viewWithTag:kTagActionTab];
+    if (actTab) {
+        // 已存在 (源码 VCamActionPatch 注入): 补充 target, 防源码 KVC 时序问题
+        BOOL hasMyTarget = NO;
+        for (id t in [actTab allTargets]) {
+            if ([t isKindOfClass:[VcamFixCtrlTarget class]]) { hasMyTarget = YES; break; }
+        }
+        if (!hasMyTarget) {
+            [actTab addTarget:[VcamFixCtrlTarget shared]
+                       action:@selector(onActionTabTapped:)
+             forControlEvents:UIControlEventTouchUpInside];
+            VcamFix_Log(@"[vcam][fix] action tab target appended");
+        }
+    } else {
+        // 未注入: 自己兜底注入
         CGFloat totalW = tabW * 2 + 6;
         CGFloat x0 = (panelW - totalW) / 2;
         ctrlBtn.frame = CGRectMake(x0, tabY, tabW, tabH);
@@ -571,7 +551,7 @@ static void VcamFix_PatchUI(void) {
         actionPage.frame = pf;
 
         [panelView addSubview:actionPage];
-        VcamFix_Log(@"[vcam][fix] action tab + page injected");
+        VcamFix_Log(@"[vcam][fix] action tab + page injected (兜底)");
     }
 }
 
@@ -591,7 +571,6 @@ static void VcamFixInit(void) {
         if (isMd || isLskdd) {
             Class coreCls = VcamFix_CoreClass();
             if (coreCls) {
-                // 1) swizzle render 入口刷门禁
                 SEL sRender = NSSelectorFromString(@"renderReplacementToPixelBuffer:pts:");
                 Method mRender = class_getInstanceMethod(coreCls, sRender);
                 if (mRender) {
@@ -600,7 +579,6 @@ static void VcamFixInit(void) {
                     method_setImplementation(mRender, (IMP)VcamFix_renderPts);
                     VcamFix_Log(@"[vcam][fix] swizzled render OK");
                 }
-                // 2) swizzle setEnabled: 拦截与 plist 不一致的调用
                 SEL sSet = NSSelectorFromString(@"setEnabled:");
                 Method mSet = class_getInstanceMethod(coreCls, sSet);
                 if (mSet) {
@@ -621,18 +599,6 @@ static void VcamFixInit(void) {
             dispatch_resume(gVcamFixEnabledTimer);
 
         } else if (isSB) {
-            // swizzle VCamHidePatch.pollForPanelAndInjectButton -> 空
-            // (防止它把 hideBtn 覆盖到 "+" 按钮位置)
-            Class hideCls = NSClassFromString(@"VCamHidePatch");
-            if (hideCls) {
-                SEL sPoll = NSSelectorFromString(@"pollForPanelAndInjectButton");
-                Method mPoll = class_getClassMethod(hideCls, sPoll);
-                if (mPoll) {
-                    method_setImplementation(mPoll, (IMP)VcamFix_pollHideStub);
-                    VcamFix_Log(@"[vcam][fix] swizzled VCamHidePatch.pollForPanelAndInjectButton -> stub");
-                }
-            }
-
             dispatch_queue_t q = dispatch_get_main_queue();
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                            q, ^{ VcamFix_PatchUI(); });
