@@ -8,7 +8,9 @@
 #import <objc/message.h>
 #import "VCamNotify.h"
 
-static dispatch_source_t gTimer = nil;
+// 文件级 timer 保活 (防 ARC 释放, 且不触发 unused-but-set 警告)
+static dispatch_source_t gTimerMD   = nil;
+static dispatch_source_t gTimerSB   = nil;
 
 #pragma mark - 日志
 static void VcamFix_Log(NSString *msg) {
@@ -84,7 +86,6 @@ static void VcamFix_render(id self, SEL _cmd, CVPixelBufferRef pb, double pts) {
 }
 
 #pragma mark - timer: 同步 plist.enabled -> VCamCore.setEnabled:
-// (源码 polling 因 _licMark=NO 恒算 effEnabled=NO, setEnabled: 永远不调)
 static void VcamFix_SyncEnabled(void) {
     Class cls = VcamFix_CoreClass();
     if (!cls) return;
@@ -137,13 +138,11 @@ static void VcamFix_actionTabTapped(id self, SEL _cmd) {
     if (controlTab) controlTab.backgroundColor = inactive;
     actionTab.backgroundColor = active;
 
-    // 刷新状态标签 (源码 VCamActionPatch 的方法)
     SEL s1 = NSSelectorFromString(@"refreshStatus");
     if ([self respondsToSelector:s1]) ((void(*)(id,SEL))[self methodForSelector:s1])(self, s1);
     SEL s2 = NSSelectorFromString(@"refreshDuration");
     if ([self respondsToSelector:s2]) ((void(*)(id,SEL))[self methodForSelector:s2])(self, s2);
 
-    // 面板高度扩到 action 页底部
     CGFloat pageTop = actionPage.frame.origin.y;
     CGFloat contentH = actionPage.frame.size.height;
     CGFloat targetH = pageTop + contentH + 10;
@@ -154,7 +153,7 @@ static void VcamFix_actionTabTapped(id self, SEL _cmd) {
     }];
 }
 
-#pragma mark - 控制页 target 桥 (等价源码 VCamFloatingBall.controlTabTapped)
+#pragma mark - 控制页 target 桥
 @interface VcamFixCtrlTarget : NSObject
 + (instancetype)shared;
 - (void)onControlTabTapped:(id)sender;
@@ -188,7 +187,6 @@ static void VcamFix_actionTabTapped(id self, SEL _cmd) {
     if (ctrlBtn) ctrlBtn.backgroundColor = active;
     if (actBtn)  actBtn.backgroundColor  = inactive;
 
-    // 恢复 panelView 高度 (等价源码 applyPanelContentHeight:)
     CGFloat targetH = controlPage.frame.origin.y + controlPage.frame.size.height + 10;
     [UIView animateWithDuration:0.18 animations:^{
         CGRect f = panelView.frame;
@@ -198,7 +196,7 @@ static void VcamFix_actionTabTapped(id self, SEL _cmd) {
 }
 @end
 
-#pragma mark - VCamHidePatch 三处 (照搬源码, 只加类名 fallback)
+#pragma mark - VCamHidePatch 三处
 static void VcamFix_hideBall(Class self, SEL _cmd) {
     @try {
         NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:VcamFix_PlistPath()];
@@ -242,7 +240,6 @@ static void VcamFix_pollHide(Class self, SEL _cmd) {
     if (!cpv) return;
     if ([cpv viewWithTag:0x56434D31]) { injected = YES; return; }
 
-    // 找末行底部 (不覆盖 −/+)
     CGFloat maxBottom = -1, cellH = 0;
     for (UIView *sub in cpv.subviews) {
         if (![sub isKindOfClass:[UIButton class]]) continue;
@@ -321,7 +318,7 @@ static void VcamFix_updateReplaceButtonVisual(id self, SEL _cmd) {
         : [UIColor clearColor].CGColor;
 }
 
-#pragma mark - 给 tabControlBtn 追加 target (轮询式, panelView 就绪后)
+#pragma mark - 给 tabControlBtn 追加 target
 static void VcamFix_ensureControlTabTarget(void) {
     id ball = VcamFix_BallInstance();
     if (!ball) return;
@@ -359,18 +356,17 @@ static void VcamFixInit(void) {
                 }
             }
             dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
-            gTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-            dispatch_source_set_timer(gTimer,
+            gTimerMD = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+            dispatch_source_set_timer(gTimerMD,
                 dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
                 (uint64_t)(0.1 * NSEC_PER_SEC), (uint64_t)(0.02 * NSEC_PER_SEC));
-            dispatch_source_set_event_handler(gTimer, ^{
+            dispatch_source_set_event_handler(gTimerMD, ^{
                 @autoreleasepool { VcamFix_SyncEnabled(); }
             });
-            dispatch_resume(gTimer);
+            dispatch_resume(gTimerMD);
             VcamFix_Log(@"[vcam][fix] md init");
 
         } else if (isSB) {
-            // 只禁用不启用 + 标题固定
             Class ballCls = VcamFix_BallClass();
             if (ballCls) {
                 Method mt = class_getInstanceMethod(ballCls, NSSelectorFromString(@"toggleReplacementTapped"));
@@ -378,13 +374,11 @@ static void VcamFixInit(void) {
                 Method mu = class_getInstanceMethod(ballCls, NSSelectorFromString(@"updateReplaceButtonVisual"));
                 if (mu) method_setImplementation(mu, (IMP)VcamFix_updateReplaceButtonVisual);
             }
-            // 动作 tab 切换 (照搬完整版逻辑)
             Class actCls = NSClassFromString(@"VCamActionPatch");
             if (actCls) {
                 Method m = class_getInstanceMethod(actCls, NSSelectorFromString(@"actionTabTapped"));
                 if (m) method_setImplementation(m, (IMP)VcamFix_actionTabTapped);
             }
-            // VCamHidePatch
             Class hideCls = NSClassFromString(@"VCamHidePatch");
             if (hideCls) {
                 Method m1 = class_getClassMethod(hideCls, NSSelectorFromString(@"hideBall"));
@@ -394,19 +388,19 @@ static void VcamFixInit(void) {
                 Method m3 = class_getClassMethod(hideCls, NSSelectorFromString(@"pollForPanelAndInjectButton"));
                 if (m3) method_setImplementation(m3, (IMP)VcamFix_pollHide);
             }
-            // tabControlBtn 追加 target
+
             dispatch_queue_t q = dispatch_get_main_queue();
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), q, ^{
                 VcamFix_ensureControlTabTarget();
             });
-            dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-            dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                                      (uint64_t)(1.0 * NSEC_PER_SEC), (uint64_t)(0.2 * NSEC_PER_SEC));
-            dispatch_source_set_event_handler(t, ^{
+            gTimerSB = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+            dispatch_source_set_timer(gTimerSB,
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                (uint64_t)(1.0 * NSEC_PER_SEC), (uint64_t)(0.2 * NSEC_PER_SEC));
+            dispatch_source_set_event_handler(gTimerSB, ^{
                 @autoreleasepool { VcamFix_ensureControlTabTarget(); }
             });
-            dispatch_resume(t);
-            static dispatch_source_t sKeep = nil; sKeep = t;
+            dispatch_resume(gTimerSB);
             VcamFix_Log(@"[vcam][fix] sb init");
         }
     }
