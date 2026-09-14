@@ -1,0 +1,5 @@
+#!/bin/bash
+set -e
+JR=$(/usr/bin/jbroot 2>/dev/null || echo "/var/jb")
+mkdir -p "$JR/Library/MobileSubstrate/DynamicLibraries" 2>/dev/null || true
+exit 0
