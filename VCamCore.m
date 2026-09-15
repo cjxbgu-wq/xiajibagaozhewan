@@ -2,6 +2,8 @@
 //  VCamCore.m
 //  核心渲染逻辑（视频替换 + 预渲染 + plist 轮询 + CPU 闭环）
 //
+//  2026-09-15 换视频残留修复: path 变化时先清 live + fallback 缓存
+//
 
 #import "VCamCore.h"
 #import <CoreImage/CoreImage.h>
@@ -16,14 +18,12 @@
 #include <objc/runtime.h>
 #import "VCamTextSig.h"
 
-// 日志令牌桶（本文件定义，其他文件 extern 引用）
 BOOL vcam_log_budget_take(void);
 
-// 车道记忆重置（GPUImageProcessor.m 定义）
 extern void vcamLaneResetAllMemos(void);
 
 // ============================================================
-//  CPU 采样（诊断用）
+//  CPU 采样
 // ============================================================
 static NSString *vcam_process_cpu_seconds(void) {
     thread_array_t threads;
@@ -44,7 +44,6 @@ static NSString *vcam_process_cpu_seconds(void) {
     return [NSString stringWithFormat:@"%.1f", total];
 }
 
-// 遥测采样（记录内存 + CPU%，值暂时未打印，保留供后续启用）
 static void vcam_telemetry_sample(uint64_t renderedFrames, NSString *streamStats) {
     (void)renderedFrames;
     (void)streamStats;
@@ -73,7 +72,7 @@ static void vcam_telemetry_sample(uint64_t renderedFrames, NSString *streamStats
 }
 
 // ============================================================
-//  日志（本地门控 + 令牌桶）
+//  日志
 // ============================================================
 static BOOL vcam_log_enabled(void) {
     static int cached = -1;
@@ -183,7 +182,7 @@ static BOOL vcamSelfIntegrityOK(void) {
 }
 
 // ============================================================
-//  延迟注入检测（反 frida / 二次 hook）
+//  延迟注入检测
 // ============================================================
 static BOOL vcamNoLateHookLibs(void) {
     static NSArray<NSString *> *snapshot = nil;
@@ -274,7 +273,6 @@ static BOOL vcamNoLateHookLibs(void) {
 - (BOOL)writeFrame:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst token:(uint64_t)token;
 @end
 
-// 进程启动时刻
 static CFAbsoluteTime gVcamProcInitTime = 0;
 
 @implementation VCamCore
@@ -432,6 +430,7 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
     if (yuv) CVPixelBufferRetain(yuv);
     uint64_t gen = self->_syncDisplayGen;
     [_processLock unlock];
+    CVPixelBufferRef bgra = NULL;
 
     // CPU 闭环降载
     {
@@ -878,11 +877,49 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             lastSyncedZoom = plistZoom;
         }
 
+        // ============================================================
+        // ★ 换视频检测 + 清缓存
+        // ============================================================
         static NSString *lastSyncedPath = nil;
         static BOOL pathSyncInit = NO;
         NSString *activePath = pl[@"activePlaybackPath"];
         if (activePath.length > 0 && ![activePath isEqualToString:lastSyncedPath]) {
             if (pathSyncInit && strongSelf.enabled) {
+                vcam_core_log([NSString stringWithFormat:
+                    @"[vcam] activePlaybackPath changed: %@ -> %@, clearing buffers + reloading",
+                    lastSyncedPath, activePath]);
+
+                // ★ 清 live 帧缓存（_processLock 保护）
+                [strongSelf->_processLock lock];
+                if (strongSelf->_liveYUVPixelBuffer) {
+                    CVPixelBufferRelease(strongSelf->_liveYUVPixelBuffer);
+                    strongSelf->_liveYUVPixelBuffer = NULL;
+                }
+                if (strongSelf->_liveBGRAPixelBuffer) {
+                    CVPixelBufferRelease(strongSelf->_liveBGRAPixelBuffer);
+                    strongSelf->_liveBGRAPixelBuffer = NULL;
+                }
+                if (strongSelf->_syncDisplayFrame) {
+                    CVPixelBufferRelease(strongSelf->_syncDisplayFrame);
+                    strongSelf->_syncDisplayFrame = NULL;
+                }
+                strongSelf->_syncDisplayGen = 0;
+                strongSelf->_lastGenAdvanceTime = 0;
+                [strongSelf->_processLock unlock];
+
+                // ★ 清 fallback 缓存（_renderLock 保护）
+                [strongSelf->_renderLock lock];
+                if (strongSelf->_fallbackFrame) {
+                    CVPixelBufferRelease(strongSelf->_fallbackFrame);
+                    strongSelf->_fallbackFrame = NULL;
+                }
+                strongSelf->_dedupLastBuffer = NULL;
+                strongSelf->_dedupLastTime = 0;
+                strongSelf->_dedupLastPts = 0;
+                strongSelf->_lastAdvancePts = 0;
+                [strongSelf->_renderLock unlock];
+
+                // 重置旋转/镜像/pan/zoom
                 strongSelf.gpuProcessor.rotationAngle = 0;
                 strongSelf.gpuProcessor.mirrored = NO;
                 strongSelf.gpuProcessor.userPanX = 0.0;
@@ -897,6 +934,7 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 lastSyncedPanY = 0.0;
                 lastSyncedZoom = 1.0;
                 vcamLaneResetAllMemos();
+
                 __weak typeof(strongSelf) wSelf = strongSelf;
                 dispatch_async(strongSelf.processingQueue, ^{
                     VCamCore *sSelf = wSelf;
@@ -921,7 +959,7 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         if (restartToken != lastRestartToken) {
             if (lastRestartToken >= 0 && strongSelf.enabled && strongSelf.videoPlayer.currentVideoPath.length > 0) {
                 [strongSelf.videoPlayer resetPlaybackPosition];
-                NSString *replayPath = [strongSelf.videoPlayer.currentVideoPath copy];
+                NSString *replayPath = [strongSelf.videoPlayer currentVideoPath copy];
                 __weak typeof(strongSelf) wSelf = strongSelf;
                 dispatch_async(strongSelf.processingQueue, ^{
                     VCamCore *sSelf = wSelf;
