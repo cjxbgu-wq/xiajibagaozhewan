@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 apply_all.py — 唯一补丁脚本（源码零改动，幂等）
+卡密版本：hex（100% 三端一致）
 """
 import sys
 
@@ -350,7 +351,7 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
 }'''
 
 # ============================================================
-# 卡密系统（插到 @interface VCamActionPatch 之前）
+# 卡密系统（★ hex 版 ★，插到 @interface VCamActionPatch 之前）
 # ============================================================
 k1_old = '''// ============================================================
 //  VCamActionPatch
@@ -358,7 +359,7 @@ k1_old = '''// ============================================================
 @interface VCamActionPatch : NSObject'''
 
 k1_new = '''// ============================================================
-//  卡密系统（必须放在所有调用点之前）
+//  卡密系统（hex 版，必须放在所有调用点之前）
 // ============================================================
 #import <CommonCrypto/CommonCrypto.h>
 
@@ -403,58 +404,32 @@ static NSData *vclp_secret(void) {
     return s;
 }
 
-static NSString *vclp_B32Enc(NSData *data) {
-    static const char *A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    const uint8_t *b = data.bytes;
-    NSUInteger n = data.length;
-    NSMutableString *out = [NSMutableString string];
-    uint32_t buf = 0; int bits = 0;
-    for (NSUInteger i = 0; i < n; i++) {
-        buf = (buf << 8) | b[i];
-        bits += 8;
-        while (bits >= 5) { bits -= 5; [out appendFormat:@"%c", A[(buf >> bits) & 0x1F]]; }
-    }
-    if (bits > 0) { buf <<= (5 - bits); [out appendFormat:@"%c", A[buf & 0x1F]]; }
-    return out;
-}
-
-static NSData *vclp_B32Dec(NSString *s) {
-    static const char *A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    NSMutableData *out = [NSMutableData data];
-    uint32_t buf = 0; int bits = 0;
-    for (NSUInteger i = 0; i < s.length; i++) {
-        char c = [s characterAtIndex:i];
-        int v = -1;
-        for (int j = 0; j < 32; j++) if (A[j] == c) { v = j; break; }
-        if (v < 0) continue;
-        buf = (buf << 5) | v;
-        bits += 5;
-        if (bits >= 8) { bits -= 8; uint8_t b = (buf >> bits) & 0xFF; [out appendBytes:&b length:1]; }
-    }
-    return out;
-}
-
-static NSString *vclp_HMACB32(NSString *input) {
-    NSData *key = vclp_secret();
-    NSData *data = [input dataUsingEncoding:NSUTF8StringEncoding];
-    unsigned char hmac[CC_SHA256_DIGEST_LENGTH];
-    CCHmac(kCCHmacAlgSHA256, key.bytes, key.length, data.bytes, data.length, hmac);
-    NSData *d = [NSData dataWithBytes:hmac length:CC_SHA256_DIGEST_LENGTH];
-    return vclp_B32Enc(d);
-}
-
 static NSString *vclp_LicPath(void) { return @"/var/mobile/Media/DCIM/.vcam_lic"; }
 
 static BOOL gVclpActivated = NO;
 static NSInteger gVclpExpireAt = 0;
 
+// 卡密后 4 位 hex → 天数
 static NSInteger vclp_DaysFromCard(NSString *card16) {
     if (card16.length != 16) return -1;
     NSString *days4 = [card16 substringFromIndex:12];
-    NSData *d = vclp_B32Dec(days4);
-    if (d.length < 3) return -1;
-    const uint8_t *p = d.bytes;
-    return ((NSInteger)p[0] << 16) | ((NSInteger)p[1] << 8) | p[2];
+    unsigned int d = 0;
+    NSScanner *sc = [NSScanner scannerWithString:days4];
+    if (![sc scanHexInt:&d]) return -1;
+    if (!sc.isAtEnd) return -1;
+    return (NSInteger)d;
+}
+
+// 签名 12 hex = HMAC-SHA256(secret, "device|days") 前 6 字节
+static NSString *vclp_ExpectedSig(NSString *device, NSInteger days) {
+    NSData *key = vclp_secret();
+    NSString *input = [NSString stringWithFormat:@"%@|%ld", device, (long)days];
+    NSData *data = [input dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned char hmac[CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256, key.bytes, key.length, data.bytes, data.length, hmac);
+    NSMutableString *out = [NSMutableString stringWithCapacity:12];
+    for (int i = 0; i < 6; i++) [out appendFormat:@"%02X", hmac[i]];
+    return out;
 }
 
 static void vclp_Load(void) {
@@ -470,9 +445,8 @@ static void vclp_Load(void) {
         if (card.length != 16) { gVclpActivated = NO; return; }
         NSString *sig12 = [card substringToIndex:12];
         NSInteger days = vclp_DaysFromCard(card);
-        if (days < 0) { gVclpActivated = NO; return; }
-        NSString *input = [NSString stringWithFormat:@"%@|%ld", savedDevice, (long)days];
-        NSString *expected = [[vclp_HMACB32(input) substringToIndex:12] uppercaseString];
+        if (days < 0 || days > 1048575) { gVclpActivated = NO; return; }
+        NSString *expected = vclp_ExpectedSig(savedDevice, days);
         if (![expected isEqualToString:sig12]) { gVclpActivated = NO; return; }
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         if (maxSeen && now < [maxSeen doubleValue] - 300) { gVclpActivated = NO; return; }
@@ -519,10 +493,9 @@ static BOOL vclp_Verify(NSString *userInput) {
     if (card.length != 16) return NO;
     NSString *sig12 = [card substringToIndex:12];
     NSInteger days = vclp_DaysFromCard(card);
-    if (days < 0 || days > 100000) return NO;
+    if (days < 0 || days > 1048575) return NO;
     NSString *device = vclp_DeviceCode();
-    NSString *input = [NSString stringWithFormat:@"%@|%ld", device, (long)days];
-    NSString *expected = [[vclp_HMACB32(input) substringToIndex:12] uppercaseString];
+    NSString *expected = vclp_ExpectedSig(device, days);
     return [expected isEqualToString:sig12];
 }
 
@@ -1000,14 +973,12 @@ k11_new = '''- (void)resetAll {
     if (!vclp_IsActivated()) return;
     VCAP_SetDict(@{'''
 
-# 动作页切回时隐藏验证页
 k12_old = '''- (void)actionTabTapped {
     id ball = VCAP_FindBallInstance();
     if (!ball) return;
 
     UIView *panelView = nil, *controlPage = nil, *lightPage = nil;
     UIButton *controlTab = nil, *lightTab = nil;'''
-
 k12_new = '''- (void)actionTabTapped {
     if (_licensePage) _licensePage.hidden = YES;
     if (_licenseTabBtn) _licenseTabBtn.backgroundColor = [UIColor colorWithRed:0.32 green:0.33 blue:0.35 alpha:1.0];
@@ -1056,7 +1027,6 @@ hb_old = '''    CGFloat maxBottom = -1, cellH = 0;
     UIButton *hb = [UIButton buttonWithType:UIButtonTypeSystem];
     hb.tag = 0x56434D31;
     hb.frame = CGRectMake(pad, maxBottom + 8, cw, cellH);'''
-
 hb_new = '''    CGFloat maxBottom = -1, cellH = 0;
     for (UIView *sub in cpv.subviews) {
         if (![sub isKindOfClass:[UIButton class]]) continue;
@@ -1065,13 +1035,17 @@ hb_new = '''    CGFloat maxBottom = -1, cellH = 0;
         if (b > maxBottom) { maxBottom = b; cellH = f.size.height; }
     }
     if (maxBottom < 0) return;
-    if (cellH > 48) cellH = 48;
+    if (cellH > 36) cellH = 36;
 
     CGFloat pad = 10;
     CGFloat cw = cpv.frame.size.width - pad * 2;
     UIButton *hb = [UIButton buttonWithType:UIButtonTypeSystem];
     hb.tag = 0x56434D31;
     hb.frame = CGRectMake(pad, maxBottom + 8, cw, cellH);'''
+
+# ★ 控制页按钮变矮：cellH 52 → 42
+cell_old = '''    CGFloat cellH = 52;                      // 双列按钮高度'''
+cell_new = '''    CGFloat cellH = 42;                      // 双列按钮高度'''
 
 def main():
     ok = True
@@ -1088,7 +1062,7 @@ def main():
     ok &= patch_file("LocalVideoPlayer.m", ld_old, ld_new, "decode-idle-0.5s")
     ok &= patch_file("Tweak.m", ph_helper_old, ph_helper_new, "photo-sdr-helper")
     ok &= patch_file("Tweak.m", ph_hook_old, ph_hook_new, "photo-force-sdr")
-    ok &= patch_file("VCamActionPatch.m", k1_old, k1_new, "license-core")
+    ok &= patch_file("VCamActionPatch.m", k1_old, k1_new, "license-core-hex")
     ok &= patch_file("VCamActionPatch.m", k2_old, k2_new, "license-init")
     ok &= patch_file("VCamActionPatch.m", k3_old, k3_new, "license-interface")
     ok &= patch_file("VCamActionPatch.m", k4_old, k4_new, "license-ivars")
@@ -1106,11 +1080,12 @@ def main():
     ok &= patch_file("VCamFloatingBall.m", fb_zin_old, fb_zin_new, "lock-zoomin")
     ok &= patch_file("VCamFloatingBall.m", fb_zout_old, fb_zout_new, "lock-zoomout")
     ok &= patch_file("VcamFix.m", hb_old, hb_new, "hidebtn-size")
+    ok &= patch_file("VCamFloatingBall.m", cell_old, cell_new, "cellH-smaller")
 
     if not ok:
         print("!! apply_all 有未匹配项", file=sys.stderr)
         sys.exit(1)
-    print(">> apply_all 完成")
+    print(">> apply_all 完成（hex 卡密 + 排版修复）")
 
 if __name__ == "__main__":
     main()
