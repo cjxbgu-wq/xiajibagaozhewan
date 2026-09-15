@@ -377,7 +377,7 @@ static void fxSeekUs(int64_t us, NSString *path) {
 
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
 
-    // ★ 防抖窗口 300ms → 50ms (眨→嘴快速切换不再被合并吞掉)
+    // ★ 防抖窗口 300ms → 50ms
     if (gPendingSeekUs == us && (now - gPendingSeekAt) < 0.05) {
         return;
     }
@@ -387,7 +387,7 @@ static void fxSeekUs(int64_t us, NSString *path) {
     gPendingSeekAt = now;
 
     int64_t capturedUs = us;
-    // ★ 异步延迟 50ms → 5ms (几乎即时执行)
+    // ★ 异步延迟 50ms → 5ms
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.005 * NSEC_PER_SEC)),
                    gSeekQueue, ^{
         @autoreleasepool {
@@ -558,7 +558,7 @@ static void fxStartPoller(void) {
     gPoller = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
     if (!gPoller) return;
 
-    // ★ poller 1.0s → 0.2s (notify 丢失时也能 200ms 内捕获)
+    // ★ poller 1.0s → 0.2s
     dispatch_source_set_timer(gPoller,
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
         (uint64_t)(0.2 * NSEC_PER_SEC),
