@@ -42,9 +42,20 @@ jobs:
       - name: Install ldid
         run: brew install ldid
 
+      - name: Apply fix.patch (idempotent)
+        run: |
+          set -e
+          if grep -qF '[strongSelf.videoPlayer currentVideoPath copy]' VCamCore.m; then
+            echo ">> 检测到原始错误行，应用补丁"
+            patch -p1 --forward < fix.patch
+          else
+            echo ">> VCamCore.m 已是修正版本，跳过补丁"
+          fi
+          echo "---- VCamCore.m 第 962 行现状 ----"
+          sed -n '960,964p' VCamCore.m
+
       - name: Build
         run: |
-          patch -p1 --forward < fix.patch
           chmod +x build.sh
           ./build.sh
 
