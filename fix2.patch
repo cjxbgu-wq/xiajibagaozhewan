@@ -63,12 +63,6 @@
  }
 --- a/GPUImageProcessor.m
 +++ b/GPUImageProcessor.m
-@@ -1,4 +1,4 @@
--//
-+//
- //  GPUImageProcessor.m
- //  图像处理器（旋转/镜像/格式转换/用户变换 + 绿边修复）
- //
 @@ -1017,6 +1017,7 @@
          [_laneLockPrivate unlock];
          if (ok) {
