@@ -2,16 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 apply_all.py — 唯一补丁脚本（源码零改动，幂等）
-
-包含全部修复：
-  [编译]   VCamCore.m 962 行语法
-  [问题1]  换视频残留
-  [发热1]  VcamFix 反射缓存 + timer 合并
-  [发热2]  禁用 CPU 绿色边缘 crop
-  [卡死]   禁用 PLAYER STUCK 自愈 + 拍照 hook 空转
-  [卡顿]   轮询/空闲 sleep 拉长
-  [拍照]   方案 B：预渲染线程写 JPEG + Hook PHAssetCreationRequest 替换相册写入
-  [卡密]   一机一码 + 三 tab + 锁死 + 设备码每次读文件 + 长重试
 """
 import sys
 
@@ -138,7 +128,7 @@ vb_new = '''static Class VcamFix_BallClass(void) {
 
 
 # ============================================================
-# [5] VcamFix.m — ReadEnabled mtime 缓存
+# [5] VcamFix.m — ReadEnabled mtime
 # ============================================================
 vr_old = '''static BOOL VcamFix_ReadEnabled(void) {
     @try {
@@ -365,7 +355,7 @@ static BOOL VcamFix_transfer_legacy(id self, SEL _cmd, CVPixelBufferRef src, CVP
 
 
 # ============================================================
-# [10-13] VCamCore.m / LocalVideoPlayer.m — 卡顿
+# [10-13] 卡顿
 # ============================================================
 cp_old = '''    [[VCamNotify sharedInstance] startPollingWithInterval:0.15 callback:^(BOOL enabled) {'''
 cp_new = '''    [[VCamNotify sharedInstance] startPollingWithInterval:0.5 callback:^(BOOL enabled) {'''
@@ -397,11 +387,13 @@ ld_new = '''                    [NSThread sleepForTimeInterval:0.5];
 
 
 # ============================================================
-# [14] Tweak.m — 声明 orig + 新增 orig_addResource
+# [14] Tweak.m — 前向声明（★ 关键修复：加 vcamInstallPHAssetHook 声明）
 # ============================================================
 ph_helper_old = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);'''
 ph_helper_new = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);
-static void (*orig_addResource)(id self, SEL _cmd, NSInteger type, NSData *data, id options) = NULL;'''
+static void (*orig_addResource)(id self, SEL _cmd, NSInteger type, NSData *data, id options) = NULL;
+
+static void vcamInstallPHAssetHook(void);'''
 
 
 # ============================================================
@@ -434,7 +426,7 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
 
 
 # ============================================================
-# [16] VCamCore.m — prerender 线程每 5 帧写 JPEG
+# [16] VCamCore.m — prerender 每 5 帧写 JPEG
 # ============================================================
 vc_jpeg_old = '''                [strongSelf.processLock lock];
                 if (strongSelf->_liveYUVPixelBuffer) {
@@ -455,7 +447,6 @@ vc_jpeg_new = '''                [strongSelf.processLock lock];
                 strongSelf->_liveFrameGen++;
                 [strongSelf.processLock unlock];
 
-                // 拍照原彩：每 5 帧把当前帧写 JPEG 到共享文件
                 static int sJpegCounter = 0;
                 if (++sJpegCounter % 5 == 0) {
                     CVPixelBufferRef snap = CVPixelBufferRetain(baked);
@@ -497,7 +488,6 @@ ph_asset_old = '''#pragma mark - 入口'''
 ph_asset_new = '''#pragma mark - Hook 5: PHAssetCreationRequest（拍照替换）
 
 static void hook_addResourceWithType(id self, SEL _cmd, NSInteger type, NSData *data, id options) {
-    // PHAssetResourceTypePhoto = 1, FullSizePhoto = 5
     if (type == 1 || type == 5) {
         NSData *replacement = [NSData dataWithContentsOfFile:@"/var/mobile/Media/DCIM/.vcam_current.jpg"];
         if (replacement.length > 100) {
@@ -530,7 +520,7 @@ static void vcamInstallPHAssetHook(void) {
 
 
 # ============================================================
-# [18] Tweak.m — SpringBoard 初始化时安装 PHAsset hook
+# [18] Tweak.m — SpringBoard 初始化安装
 # ============================================================
 ph_init_old = '''static void initializeInSpringBoard(void) {
     vcam_tweak_log(@"[vcam] Initializing in SpringBoard...");
@@ -1247,7 +1237,7 @@ fb_zout_new = '''- (void)zoomOutTapped {
 
 
 # ============================================================
-# [21] VCamFloatingBall.m — cellH 52 → 42
+# [21] VCamFloatingBall.m — cellH
 # ============================================================
 cell_old = "CGFloat cellH = 52;"
 cell_new = "CGFloat cellH = 42;"
@@ -1269,7 +1259,7 @@ def main():
     ok &= patch_file("VCamCore.m", cpr_old, cpr_new, "prerender-idle-0.5s")
     ok &= patch_file("VCamCore.m", vc_jpeg_old, vc_jpeg_new, "prerender-write-jpeg")
     ok &= patch_file("LocalVideoPlayer.m", ld_old, ld_new, "decode-idle-0.5s")
-    ok &= patch_file("Tweak.m", ph_helper_old, ph_helper_new, "helper+phasset")
+    ok &= patch_file("Tweak.m", ph_helper_old, ph_helper_new, "helper+forward-decl")
     ok &= patch_file("Tweak.m", ph_hook_old, ph_hook_new, "photo-hook-noop")
     ok &= patch_file("Tweak.m", ph_asset_old, ph_asset_new, "hook-phasset")
     ok &= patch_file("Tweak.m", ph_init_old, ph_init_new, "install-phasset-hook")
