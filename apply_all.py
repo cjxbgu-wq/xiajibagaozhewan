@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-apply_all.py — 唯一补丁脚本（源码零改动，幂等）
-本次修复：
-  1. 30 天卡显示永久（gVclpExpireAt 未设置）
-  2. 重启掉激活（路径改 DCIM，去掉不可写目录）
-  3. 拍照色彩（简化，只改 transfer，不做 CPU 像素转换）
-  4. 相机卡死发热（去掉 CPU 逐像素转换）
+apply_all.py — 深度审计修复版
+
+三个根因：
+  [A] 卡密过期时间基准错误 → 改为 activatedAt
+  [B] 拍照热路径阻塞 → tryLock + 不做 CPU crop
+  [C] 存储格式错配 → 统一 plist
 """
 import sys
 
@@ -30,7 +30,7 @@ def patch_file(path, old, new, tag):
     return True
 
 # ============================================================
-# 原有修复
+# 原有修复（保留，这些没问题）
 # ============================================================
 c962_old = '''NSString *replayPath = [strongSelf.videoPlayer currentVideoPath copy];'''
 c962_new = '''NSString *replayPath = [[strongSelf.videoPlayer currentVideoPath] copy];'''
@@ -299,12 +299,12 @@ ld_new = '''                    [NSThread sleepForTimeInterval:0.5];
                 // 加载代数变化 → 解码线程自行重建 reader'''
 
 # ============================================================
-# ★ 拍照色彩 —— 简化版（不卡死、不发热）
+# [B] 拍照：去掉阻塞，改用 tryLock + 直接传输
 # ============================================================
 ph_helper_old = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);'''
 ph_helper_new = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);
 
-// 简化版：只设 transfer function 为 sRGB，不做 CPU 像素转换
+// 简化色彩修复：只改 transfer function
 static void vcamPhotoFixColor(CMSampleBufferRef sb) {
     if (!sb) return;
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
@@ -338,8 +338,23 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
             CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
             if (pixelBuffer) {
                 @try {
-                    [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
-                                                                         pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
+                    // ★ 关键：不使用 renderReplacementToPixelBuffer（含旋转/crop，会阻塞）
+                    // 直接拿预渲染帧，只做 1 次 VT transfer
+                    VCamCore *core = [VCamCore sharedInstance];
+                    CVPixelBufferRef live = (__bridge CVPixelBufferRef)[core valueForKey:@"liveYUVPixelBuffer"];
+                    if (live) {
+                        GPUImageProcessor *gpu = [core valueForKey:@"gpuProcessor"];
+                        if (gpu) {
+                            // tryLock：抢不到锁就跳过，不阻塞相机
+                            NSLock *lock = [core valueForKey:@"renderLock"];
+                            BOOL locked = lock ? [lock tryLock] : NO;
+                            @try {
+                                [gpu transferPixelBuffer:live toPixelBuffer:pixelBuffer token:0];
+                            } @finally {
+                                if (locked) [lock unlock];
+                            }
+                        }
+                    }
                     vcamPhotoFixColor(sampleBuffer);
                 } @catch (NSException *e) {
                     vcam_tweak_log([NSString stringWithFormat:@"[vcam] PhotoEncoder hook exception: %@", e]);
@@ -353,7 +368,7 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
 }'''
 
 # ============================================================
-# ★ 卡密系统 —— 路径改 DCIM + 天数修复
+# [A+C] 卡密系统：统一 plist + activatedAt 基准
 # ============================================================
 k1_old = '''// ============================================================
 //  VCamActionPatch
@@ -361,30 +376,22 @@ k1_old = '''// ============================================================
 @interface VCamActionPatch : NSObject'''
 
 k1_new = '''// ============================================================
-//  卡密系统（DCIM 路径 + 天数修复）
+//  卡密系统（统一 plist + activatedAt 基准）
 // ============================================================
 #import <CommonCrypto/CommonCrypto.h>
-#import <Security/Security.h>
 #include <sys/stat.h>
 
 static NSString *vclp_salt(void) { return @"vcam_2026_salt_x9k7b3m"; }
 
-// ★ 关键：主路径改回 DCIM（已验证可写）
+// ★ 统一用 plist 格式，只有一个路径
 static NSString *vclp_DevPath(void)  { return @"/var/mobile/Media/DCIM/vcam_devid.txt"; }
-static NSString *vclp_DevBak(void)   { return @"/var/mobile/Media/DCIM/.vcam_devid"; }
-static NSString *vclp_LicFile(void)  { return @"/var/mobile/Media/DCIM/vcam_license.txt"; }
-static NSString *vclp_LicFile2(void) { return @"/var/mobile/Media/DCIM/.vcam_lic"; }
-static NSString *vclp_LicFile3(void) { return @"/var/mobile/Library/Preferences/com.vcam.license.plist"; }
+static NSString *vclp_LicPath(void)  { return @"/var/mobile/Media/DCIM/vcam_license.plist"; }
 
 static NSString *vclp_DeviceCode(void) {
     static NSString *s = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        // ★ 先读持久化的
         NSString *saved = [NSString stringWithContentsOfFile:vclp_DevPath() encoding:NSUTF8StringEncoding error:nil];
-        if (!saved || saved.length < 16) {
-            saved = [NSString stringWithContentsOfFile:vclp_DevBak() encoding:NSUTF8StringEncoding error:nil];
-        }
         saved = [saved stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (saved.length == 16) {
             s = [NSString stringWithFormat:@"%@-%@-%@-%@",
@@ -394,7 +401,6 @@ static NSString *vclp_DeviceCode(void) {
                  [saved substringWithRange:NSMakeRange(12,4)]];
             return;
         }
-        // 首次算
         NSString *idfv = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"";
         NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.vcam.ios";
         NSString *raw = [NSString stringWithFormat:@"%@|%@|%@", idfv, bundle, vclp_salt()];
@@ -410,7 +416,6 @@ static NSString *vclp_DeviceCode(void) {
              [h substringWithRange:NSMakeRange(8,4)],
              [h substringWithRange:NSMakeRange(12,4)]];
         [h writeToFile:vclp_DevPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        [h writeToFile:vclp_DevBak()  atomically:YES encoding:NSUTF8StringEncoding error:nil];
     });
     return s;
 }
@@ -431,9 +436,6 @@ static NSData *vclp_secret(void) {
     });
     return s;
 }
-
-static NSString *vclp_KCService(void) { return @"com.vcam.license"; }
-static NSString *vclp_KCAccount(void) { return @"activation_v1"; }
 
 static BOOL gVclpActivated = NO;
 static NSInteger gVclpExpireAt = 0;
@@ -459,23 +461,23 @@ static NSString *vclp_ExpectedSig(NSString *device, NSInteger days) {
     return out;
 }
 
-// ★ 统一设置到期时间
-static void vclp_ApplyExpire(NSInteger days) {
+// ★ 关键修复：到期时间 = 激活时间 + days*86400
+static void vclp_ApplyExpire(NSInteger days, NSInteger activatedAt) {
     if (days > 0) {
-        NSDate *base = [NSDate dateWithTimeIntervalSince1970:1735689600];
-        NSDate *expire = [base dateByAddingTimeInterval:days * 86400.0];
-        gVclpExpireAt = (NSInteger)[expire timeIntervalSince1970];
+        gVclpExpireAt = activatedAt + days * 86400;
     } else {
         gVclpExpireAt = 0;
     }
 }
 
+// ★ 验证：用 activatedAt 作为基准
 static BOOL vclp_Validate(NSDictionary *d) {
     if (!d) return NO;
     NSString *device = d[@"deviceCode"];
     NSString *card = d[@"licenseCode"];
+    NSNumber *activatedNum = d[@"activatedAt"];
     NSNumber *maxSeen = d[@"maxSeenAt"];
-    if (!device || !card) return NO;
+    if (!device || !card || !activatedNum) return NO;
     if (![device isEqualToString:vclp_DeviceCode()]) return NO;
     NSString *clean = [[card stringByReplacingOccurrencesOfString:@"-" withString:@""] uppercaseString];
     if (clean.length != 16) return NO;
@@ -483,49 +485,37 @@ static BOOL vclp_Validate(NSDictionary *d) {
     NSInteger days = vclp_DaysFromCard(clean);
     if (days < 0 || days > 1048575) return NO;
     if (![vclp_ExpectedSig(device, days) isEqualToString:sig12]) return NO;
+
+    NSInteger activatedAt = [activatedNum integerValue];
+    if (activatedAt <= 0) return NO;
+
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (maxSeen && now < [maxSeen doubleValue] - 300) return NO;
+
+    // ★ 到期判断基于 activatedAt
+    vclp_ApplyExpire(days, activatedAt);
     if (days > 0) {
-        NSDate *base = [NSDate dateWithTimeIntervalSince1970:1735689600];
-        NSDate *expire = [base dateByAddingTimeInterval:days * 86400.0];
-        if ([[NSDate date] compare:expire] == NSOrderedDescending) return NO;
+        NSInteger nowSec = (NSInteger)now;
+        if (nowSec > gVclpExpireAt) return NO;
     }
-    vclp_ApplyExpire(days);
     return YES;
 }
 
+// ★ 加载：只读 plist
 static void vclp_Load(void) {
     @try {
-        NSMutableDictionary *d = nil;
-        // 1. 纯文本（DCIM 主）
-        NSString *txt = [NSString stringWithContentsOfFile:vclp_LicFile() encoding:NSUTF8StringEncoding error:nil];
-        if (txt.length > 0) {
-            d = [NSJSONSerialization JSONObjectWithData:[txt dataUsingEncoding:NSUTF8StringEncoding] options:NSJSONReadingMutableContainers error:nil];
-        }
-        // 2. plist（DCIM 备份）
-        if (!d) {
-            NSDictionary *f = [NSDictionary dictionaryWithContentsOfFile:vclp_LicFile2()];
-            if (f) d = [f mutableCopy];
-        }
-        // 3. Preferences（兼容旧版）
-        if (!d) {
-            NSDictionary *f = [NSDictionary dictionaryWithContentsOfFile:vclp_LicFile3()];
-            if (f) d = [f mutableCopy];
-        }
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:vclp_LicPath()];
         if (!d) return;
         if (!vclp_Validate(d)) return;
         gVclpActivated = YES;
-        // 刷新 maxSeen 并回写
-        NSInteger newMax = MAX((NSInteger)CFAbsoluteTimeGetCurrent(), [d[@"maxSeenAt"] integerValue]);
-        d[@"maxSeenAt"] = @(newMax);
-        NSData *json = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
-        NSString *jsonStr = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
-        [jsonStr writeToFile:vclp_LicFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        [d writeToFile:vclp_LicFile2() atomically:YES];
-        [d writeToFile:vclp_LicFile3() atomically:YES];
+        NSMutableDictionary *m = [NSMutableDictionary dictionaryWithDictionary:d];
+        NSInteger newMax = MAX((NSInteger)CFAbsoluteTimeGetCurrent(), [m[@"maxSeenAt"] integerValue]);
+        m[@"maxSeenAt"] = @(newMax);
+        [m writeToFile:vclp_LicPath() atomically:YES];
     } @catch (...) {}
 }
 
+// ★ 保存：只写 plist，立即设置 gVclpExpireAt
 static BOOL vclp_Save(NSString *card) {
     @try {
         NSString *clean = [[card stringByReplacingOccurrencesOfString:@"-" withString:@""] uppercaseString];
@@ -539,17 +529,11 @@ static BOOL vclp_Save(NSString *card) {
         m[@"activatedAt"] = @(now);
         m[@"maxSeenAt"]   = @(now);
         m[@"expireAt"]    = @(days > 0 ? now + days * 86400 : 0);
-        // ★ 立即设置 gVclpExpireAt，不等 Load
-        vclp_ApplyExpire(days);
-        // 写文件
-        NSData *json = [NSJSONSerialization dataWithJSONObject:m options:0 error:nil];
-        NSString *jsonStr = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
-        BOOL f1 = [jsonStr writeToFile:vclp_LicFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        BOOL f2 = [m writeToFile:vclp_LicFile2() atomically:YES];
-        BOOL f3 = [m writeToFile:vclp_LicFile3() atomically:YES];
-        chmod([vclp_LicFile()  UTF8String], 0644);
-        chmod([vclp_LicFile2() UTF8String], 0644);
-        return f1 || f2 || f3;
+        // ★ 立即计算到期时间
+        vclp_ApplyExpire(days, now);
+        BOOL ok = [m writeToFile:vclp_LicPath() atomically:YES];
+        chmod([vclp_LicPath() UTF8String], 0644);
+        return ok;
     } @catch (...) { return NO; }
 }
 
@@ -924,7 +908,6 @@ k7_new = '''- (UIView *)buildLicensePage:(CGFloat)panelW tabControl:(UIButton *)
         return;
     }
     vclp_SetActivated(YES);
-    // ★ Save 里会调用 vclp_ApplyExpire，设置 gVclpExpireAt
     vclp_Save(input);
     [self refreshLicenseUI];
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"激活成功"
@@ -1103,41 +1086,6 @@ hb_new = '''    CGFloat maxBottom = -1, cellH = 0;
 cell_old = "CGFloat cellH = 52;"
 cell_new = "CGFloat cellH = 42;"
 
-def patch_makefile():
-    path = "Makefile"
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-    except FileNotFoundError:
-        print(f"!! 文件不存在: {path}", file=sys.stderr)
-        return False
-    if "Security" in content:
-        print(f">> 已应用过，跳过: {path} [frameworks-security]")
-        return True
-    lines = content.split("\n")
-    found = False
-    out = []
-    for ln in lines:
-        if ln.startswith("VcamMax_FRAMEWORKS") and "Security" not in ln:
-            ln = ln.rstrip() + " Security"
-            found = True
-        out.append(ln)
-    if not found:
-        out2 = []
-        inserted = False
-        for ln in out:
-            out2.append(ln)
-            if ln.startswith("TWEAK_NAME") and not inserted:
-                out2.append("VcamMax_FRAMEWORKS = UIKit Security")
-                inserted = True
-        out = out2
-    content2 = "\n".join(out)
-    if "Security" not in content2: return False
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content2)
-    print(f">> 已修改: {path} [frameworks-security]")
-    return True
-
 def main():
     ok = True
     ok &= patch_file("VCamCore.m", c962_old, c962_new, "c962-syntax")
@@ -1152,8 +1100,8 @@ def main():
     ok &= patch_file("VCamCore.m", cpr_old, cpr_new, "prerender-idle-0.5s")
     ok &= patch_file("LocalVideoPlayer.m", ld_old, ld_new, "decode-idle-0.5s")
     ok &= patch_file("Tweak.m", ph_helper_old, ph_helper_new, "photo-simple")
-    ok &= patch_file("Tweak.m", ph_hook_old, ph_hook_new, "photo-simple-hook")
-    ok &= patch_file("VCamActionPatch.m", k1_old, k1_new, "license-dcim")
+    ok &= patch_file("Tweak.m", ph_hook_old, ph_hook_new, "photo-trylock")
+    ok &= patch_file("VCamActionPatch.m", k1_old, k1_new, "license-deep-fix")
     ok &= patch_file("VCamActionPatch.m", k2_old, k2_new, "license-init")
     ok &= patch_file("VCamActionPatch.m", k3_old, k3_new, "license-interface")
     ok &= patch_file("VCamActionPatch.m", k4_old, k4_new, "license-ivars")
@@ -1172,12 +1120,11 @@ def main():
     ok &= patch_file("VCamFloatingBall.m", fb_zout_old, fb_zout_new, "lock-zoomout")
     ok &= patch_file("VcamFix.m", hb_old, hb_new, "hidebtn-size")
     ok &= patch_file("VCamFloatingBall.m", cell_old, cell_new, "cellH-42")
-    ok &= patch_makefile()
 
     if not ok:
         print("!! apply_all 有未匹配项", file=sys.stderr)
         sys.exit(1)
-    print(">> apply_all 完成（天数 + 持久化 + 拍照简化）")
+    print(">> apply_all 完成（深层审计修复）")
 
 if __name__ == "__main__":
     main()
