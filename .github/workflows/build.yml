@@ -47,7 +47,8 @@ jobs:
           set -e
           python3 apply_all.py
           echo "---- 关键点校验 ----"
-          grep -n "vcamPhotoForceSDR" Tweak.m || true
+          grep -n "vcamPhotoForceSDR709" Tweak.m || true
+          grep -n "vclp_IsActivated" VCamActionPatch.m || true
           grep -n "media file changed" VcamFix.m || true
           grep -n "replayPath = " VCamCore.m || true
 
