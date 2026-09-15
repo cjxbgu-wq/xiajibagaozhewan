@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-apply_all.py — 构建时注入所有补丁（源码零改动，幂等）
+apply_all.py — 唯一补丁脚本（源码零改动，幂等）
 
-汇总以下修复：
-  [编译]   VCamCore.m 962 行 Objective-C 语法
-  [问题1]  换视频后旧视频残留（VcamFix 文件 mtime 检测）
-  [问题2]  拍照/录像色差（VT Source/Destination 色彩属性 + 中间 buffer 附件）
-  [发热]   VcamFix timer 合并、反射缓存、plist mtime 缓存
-  [卡顿]   轮询间隔、扫描周期、空闲 sleep 拉长
+包含全部修复：
+  [编译]  VCamCore.m 962 行 Objective-C 语法
+  [问题1] 换视频后旧视频残留（VcamFix 文件 mtime 检测）
+  [问题2] 拍照色差（清空相机色彩/HDR 附件，强制 SDR BT.709）
+  [发热]  VcamFix 反射缓存 / plist mtime 缓存 / timer 合并
+  [卡顿]  轮询间隔、扫描周期、空闲 sleep 拉长
 
 用法：仓库根目录执行
     python3 apply_all.py
@@ -37,14 +37,14 @@ def patch_file(path, old, new, tag):
 
 
 # ============================================================
-# [P1] VCamCore.m — 962 行语法修复
+# [1] VCamCore.m — 962 行语法修复
 # ============================================================
 c962_old = '''NSString *replayPath = [strongSelf.videoPlayer currentVideoPath copy];'''
 c962_new = '''NSString *replayPath = [[strongSelf.videoPlayer currentVideoPath] copy];'''
 
 
 # ============================================================
-# [P2] VcamFix.m — 换视频残留修复（mtime/size 检测）
+# [2] VcamFix.m — 换视频残留修复（mtime/size 检测）
 # ============================================================
 vf_old = '''        if (gLastActivePath == nil) {
             gLastActivePath = [curPath copy];
@@ -112,7 +112,7 @@ vf_new = '''        if (gLastActivePath == nil) {
 
 
 # ============================================================
-# [P3] VcamFix.m — CoreClass 缓存
+# [3] VcamFix.m — CoreClass 缓存
 # ============================================================
 vc_old = '''static Class VcamFix_CoreClass(void) {
     Class c = NSClassFromString(@"Qz1");
@@ -127,8 +127,9 @@ vc_new = '''static Class VcamFix_CoreClass(void) {
     return c;
 }'''
 
+
 # ============================================================
-# [P4] VcamFix.m — BallClass 缓存
+# [4] VcamFix.m — BallClass 缓存
 # ============================================================
 vb_old = '''static Class VcamFix_BallClass(void) {
     Class c = NSClassFromString(@"Jx6");
@@ -143,8 +144,9 @@ vb_new = '''static Class VcamFix_BallClass(void) {
     return c;
 }'''
 
+
 # ============================================================
-# [P5] VcamFix.m — ReadEnabled mtime 缓存
+# [5] VcamFix.m — ReadEnabled mtime 缓存
 # ============================================================
 vr_old = '''static BOOL VcamFix_ReadEnabled(void) {
     @try {
@@ -170,8 +172,9 @@ vr_new = '''static BOOL VcamFix_ReadEnabled(void) {
     return sCached;
 }'''
 
+
 # ============================================================
-# [P6] VcamFix.m — SyncEnabled Ivar 缓存
+# [6] VcamFix.m — SyncEnabled Ivar 缓存
 # ============================================================
 vs_old = '''static void VcamFix_SyncEnabled(void) {
     Class cls = VcamFix_CoreClass();
@@ -267,8 +270,9 @@ vs_new = '''static void VcamFix_SyncEnabled(void) {
     if (!ivFc) ivFc = class_getInstanceVariable([player class], "frameCount");
     if (ivFc) fc = *(uint64_t *)((uint8_t *)(__bridge void *)player + ivar_getOffset(ivFc));'''
 
+
 # ============================================================
-# [P7] VcamFix.m — 合并 timer
+# [7] VcamFix.m — 合并 timer
 # ============================================================
 vt_old = '''            dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
 
@@ -310,20 +314,23 @@ vt_new = '''            dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS
             });
             dispatch_resume(gTimerMD);'''
 
+
 # ============================================================
-# [P8] VCamCore.m — 轮询 0.15s → 0.5s
+# [8] VCamCore.m — 轮询 0.15s → 0.5s
 # ============================================================
 cp_old = '''    [[VCamNotify sharedInstance] startPollingWithInterval:0.15 callback:^(BOOL enabled) {'''
 cp_new = '''    [[VCamNotify sharedInstance] startPollingWithInterval:0.5 callback:^(BOOL enabled) {'''
 
+
 # ============================================================
-# [P9] VCamCore.m — 反注入扫描 30s → 120s
+# [9] VCamCore.m — 反注入扫描 30s → 120s
 # ============================================================
 cs_old = '''    if (snapshot && now - lastScan < 30.0) return lastRes;'''
 cs_new = '''    if (snapshot && now - lastScan < 120.0) return lastRes;'''
 
+
 # ============================================================
-# [P10] VCamCore.m — prerender 空闲 sleep 0.1s → 0.5s
+# [10] VCamCore.m — prerender 空闲 sleep 0.1s → 0.5s
 # ============================================================
 cpr_old = '''                if (strongSelf.pipelineIdle) {
                     [NSThread sleepForTimeInterval:0.1];
@@ -336,8 +343,9 @@ cpr_new = '''                if (strongSelf.pipelineIdle) {
                     continue;
                 }'''
 
+
 # ============================================================
-# [P11] LocalVideoPlayer.m — decodeLoop 空闲 sleep 0.1s → 0.5s
+# [11] LocalVideoPlayer.m — decodeLoop 空闲 sleep 0.1s → 0.5s
 # ============================================================
 ld_old = '''                    [NSThread sleepForTimeInterval:0.1];
                     continue;
@@ -350,183 +358,124 @@ ld_new = '''                    [NSThread sleepForTimeInterval:0.5];
 
                 // 加载代数变化 → 解码线程自行重建 reader'''
 
-# ============================================================
-# [P12] GPUImageProcessor.m — 插入 3 个 helper（fix4 + fix5 合并）
-# ============================================================
-gh_anchor = '''static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {'''
-gh_code = '''static void vcamCopyAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
-    if (!src || !dst) return;
-    CFDictionaryRef atts = CVBufferGetAttachments(src, kCVAttachmentMode_ShouldPropagate);
-    if (atts) CVBufferSetAttachments(dst, atts, kCVAttachmentMode_ShouldPropagate);
-}
-
-static void vcamApplySourceColorProps(CFTypeRef session, CVPixelBufferRef src) {
-    if (!session || !src) return;
-    CFTypeRef m = CVBufferGetAttachment(src, kCVImageBufferYCbCrMatrixKey, NULL);
-    if (m) VTSessionSetProperty(session, CFSTR("SourceYCbCrMatrix"), m);
-    CFTypeRef p = CVBufferGetAttachment(src, kCVImageBufferColorPrimariesKey, NULL);
-    if (p) VTSessionSetProperty(session, CFSTR("SourceColorPrimaries"), p);
-    CFTypeRef tf = CVBufferGetAttachment(src, kCVImageBufferTransferFunctionKey, NULL);
-    if (tf) VTSessionSetProperty(session, CFSTR("SourceTransferFunction"), tf);
-}
-
-static void vcamApplyDestinationColorProps(CFTypeRef session, CVPixelBufferRef dst) {
-    if (!session || !dst) return;
-    CFTypeRef m = CVBufferGetAttachment(dst, kCVImageBufferYCbCrMatrixKey, NULL);
-    if (m) VTSessionSetProperty(session, CFSTR("DestinationYCbCrMatrix"), m);
-    CFTypeRef p = CVBufferGetAttachment(dst, kCVImageBufferColorPrimariesKey, NULL);
-    if (p) VTSessionSetProperty(session, CFSTR("DestinationColorPrimaries"), p);
-    CFTypeRef tf = CVBufferGetAttachment(dst, kCVImageBufferTransferFunctionKey, NULL);
-    if (tf) VTSessionSetProperty(session, CFSTR("DestinationTransferFunction"), tf);
-}
-
-static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {'''
 
 # ============================================================
-# [P13] GPUImageProcessor.m — rotateAndMirrorIfNeeded 同步附件
+# [12] Tweak.m — 拍照原彩 helper（清空附件 + SDR 709）
 # ============================================================
-gr_old = '''        if (dst) {
-            CFTypeRef rotValue;
-            if (total == 90)       rotValue = _rotationCW90Value;
-            else if (total == 270) rotValue = _rotationCCW90Value;
-            else                   rotValue = _rotation180Value;
-            VTSessionSetProperty(_pixelRotationSession, _rotationPropertyKey, rotValue);'''
-gr_new = '''        if (dst) {
-            vcamCopyAttachments(input, dst);
-            CFTypeRef rotValue;
-            if (total == 90)       rotValue = _rotationCW90Value;
-            else if (total == 270) rotValue = _rotationCCW90Value;
-            else                   rotValue = _rotation180Value;
-            VTSessionSetProperty(_pixelRotationSession, _rotationPropertyKey, rotValue);'''
+ph_helper_old = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);'''
 
-# 镜像分支创建 buffer 后同步附件
-gm_old = '''        CVPixelBufferRef created = NULL;
-        if (CVPixelBufferCreate(kCFAllocatorDefault, inW, inH, fmt, NULL, &created) == noErr && created) {
-            [self setPrerenderRotateBuffer:created atSlot:mslot];
-            mb = created;
-        } else {
-            [self setPrerenderRotateBuffer:NULL atSlot:mslot];
-        }'''
-gm_new = '''        CVPixelBufferRef created = NULL;
-        if (CVPixelBufferCreate(kCFAllocatorDefault, inW, inH, fmt, NULL, &created) == noErr && created) {
-            vcamCopyAttachments(work, created);
-            [self setPrerenderRotateBuffer:created atSlot:mslot];
-            mb = created;
-        } else {
-            [self setPrerenderRotateBuffer:NULL atSlot:mslot];
-        }'''
+ph_helper_new = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);
 
-# ============================================================
-# [P14] GPUImageProcessor.m — adaptiveRotateIfNeeded 同步附件
-# ============================================================
-ga_old = '''        OSStatus cc = CVPixelBufferCreate(kCFAllocatorDefault, srcH, srcW, fmt, NULL, &rotated);
-        if (cc != noErr || !rotated) {
-            [_rotationRenderLock unlock];
-            return (CVPixelBufferRef)CVPixelBufferRetain(src);
-        }'''
-ga_new = '''        OSStatus cc = CVPixelBufferCreate(kCFAllocatorDefault, srcH, srcW, fmt, NULL, &rotated);
-        if (cc != noErr || !rotated) {
-            [_rotationRenderLock unlock];
-            return (CVPixelBufferRef)CVPixelBufferRetain(src);
+// ★ 拍照原彩核心：清空相机附加的全部色彩/HDR 附件，只留 SDR BT.709
+static void vcamPhotoForceSDR(CMSampleBufferRef sb) {
+    if (!sb) return;
+    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
+    if (!pb) return;
+
+    // 1. 清空 pixelBuffer 上所有附件
+    static CFDictionaryRef sEmpty = NULL;
+    static dispatch_once_t sOnce;
+    dispatch_once(&sOnce, ^{
+        sEmpty = CFDictionaryCreate(kCFAllocatorDefault, NULL, NULL, 0,
+                                    &kCFTypeDictionaryKeyCallBacks,
+                                    &kCFTypeDictionaryValueCallBacks);
+    });
+    if (sEmpty) CVBufferSetAttachments(pb, sEmpty, kCVAttachmentMode_ShouldPropagate);
+
+    // 2. 只设置 SDR BT.709
+    CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
+                          kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                          kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
+                          kCVImageBufferColorPrimaries_ITU_R_709_2,
+                          kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
+                          kCVImageBufferTransferFunction_ITU_R_709_2,
+                          kCVAttachmentMode_ShouldPropagate);
+
+    // 3. 清空 sampleBuffer 的 sample attachments
+    CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, true);
+    if (atts && CFArrayGetCount(atts) > 0) {
+        for (CFIndex i = 0; i < CFArrayGetCount(atts); i++) {
+            CFMutableDictionaryRef d = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(atts, i);
+            if (d) CFDictionaryRemoveAllValues(d);
         }
-        vcamCopyAttachments(src, rotated);'''
+    }
+}'''
+
 
 # ============================================================
-# [P15] GPUImageProcessor.m — 私有格式车道 Source + Destination
+# [13] Tweak.m — 拍照 hook 追加 vcamPhotoForceSDR
 # ============================================================
-gp_old = '''    if (!isBgraLane && !isYuvLane) {
-        [_laneLockPrivate lock];
-        BOOL ok = vcamPrivateLaneTransfer(self, src, dst, token);
-        [_laneLockPrivate unlock];'''
-gp_new = '''    if (!isBgraLane && !isYuvLane) {
-        [_laneLockPrivate lock];
-        VTPixelTransferSessionRef psess = self.privateTransferSession;
-        if (psess) {
-            vcamApplySourceColorProps((CFTypeRef)psess, src);
-            vcamApplyDestinationColorProps((CFTypeRef)psess, dst);
+ph_hook_old = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
+    if (sampleBuffer) {
+        @autoreleasepool {
+            CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+            if (pixelBuffer) {
+                @try {
+                    [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
+                                                                         pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
+                } @catch (NSException *e) {
+                    vcam_tweak_log([NSString stringWithFormat:@"[vcam] PhotoEncoder hook exception: %@", e]);
+                }
+            }
         }
-        BOOL ok = vcamPrivateLaneTransfer(self, src, dst, token);
-        [_laneLockPrivate unlock];'''
+    }
+    if (orig_BWPhotoEncoderNode_renderSampleBuffer) {
+        orig_BWPhotoEncoderNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
+    }
+}'''
 
-# ============================================================
-# [P16] GPUImageProcessor.m — 标准 YUV/BGRA 车道 Source + Destination
-# ============================================================
-gs_old = '''    if (!session || !laneLock) return NO;
-
-    [laneLock lock];
-
-    // ★ 绿边修复 (标准 YUV 车道): BGRA 源 → YUV420 dst 且 Trim crop offset 非整数'''
-gs_new = '''    if (!session || !laneLock) return NO;
-
-    [laneLock lock];
-
-    // ★ 色彩修复：同时告知 VT 源和目标的色彩空间
-    vcamApplySourceColorProps((CFTypeRef)session, src);
-    vcamApplyDestinationColorProps((CFTypeRef)session, dst);
-
-    // ★ 绿边修复 (标准 YUV 车道): BGRA 源 → YUV420 dst 且 Trim crop offset 非整数'''
-
-# ============================================================
-# [P17] GPUImageProcessor.m — normal session 也设 Source + Destination
-# ============================================================
-gn_old = '''            if (cropped) {
-                VTPixelTransferSessionRef ns = [self normalTransferSession];
-                if (ns) {
-                    xferSrc = cropped;
-                    xferSess = ns;'''
-gn_new = '''            if (cropped) {
-                VTPixelTransferSessionRef ns = [self normalTransferSession];
-                if (ns) {
-                    vcamApplySourceColorProps((CFTypeRef)ns, cropped);
-                    vcamApplyDestinationColorProps((CFTypeRef)ns, dst);
-                    xferSrc = cropped;
-                    xferSess = ns;'''
+ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
+    if (sampleBuffer) {
+        @autoreleasepool {
+            CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+            if (pixelBuffer) {
+                @try {
+                    [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
+                                                                         pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
+                    vcamPhotoForceSDR(sampleBuffer);
+                    static int sLog = 0;
+                    if ((++sLog % 30) == 1) {
+                        vcam_tweak_log([NSString stringWithFormat:
+                            @"[vcam] photo forced SDR709 (log#%d) %zux%zu fmt=0x%x",
+                            sLog,
+                            CVPixelBufferGetWidth(pixelBuffer),
+                            CVPixelBufferGetHeight(pixelBuffer),
+                            (unsigned)CVPixelBufferGetPixelFormatType(pixelBuffer)]);
+                    }
+                } @catch (NSException *e) {
+                    vcam_tweak_log([NSString stringWithFormat:@"[vcam] PhotoEncoder hook exception: %@", e]);
+                }
+            }
+        }
+    }
+    if (orig_BWPhotoEncoderNode_renderSampleBuffer) {
+        orig_BWPhotoEncoderNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
+    }
+}'''
 
 
 def main():
     ok = True
-
-    # 顺序敏感：fix4 的 helper 必须先插，fix5 才能匹配
-    # 1. 编译修复
+    # 编译修复
     ok &= patch_file("VCamCore.m", c962_old, c962_new, "c962-syntax")
-    # 2. 换视频残留
+    # 问题1：换视频残留
     ok &= patch_file("VcamFix.m", vf_old, vf_new, "path-mtime")
-    # 3. 发热：VcamFix 缓存 + timer 合并
+    # 发热：VcamFix 缓存 + timer 合并
     ok &= patch_file("VcamFix.m", vc_old, vc_new, "cache-core-class")
     ok &= patch_file("VcamFix.m", vb_old, vb_new, "cache-ball-class")
     ok &= patch_file("VcamFix.m", vr_old, vr_new, "read-enabled-mtime")
     ok &= patch_file("VcamFix.m", vs_old, vs_new, "syncenabled-ivar-cache")
     ok &= patch_file("VcamFix.m", vt_old, vt_new, "merge-timers")
-    # 4. 发热/卡顿：VCamCore + LocalVideoPlayer
+    # 发热/卡顿：VCamCore + LocalVideoPlayer
     ok &= patch_file("VCamCore.m", cp_old, cp_new, "polling-0.5s")
     ok &= patch_file("VCamCore.m", cs_old, cs_new, "scan-120s")
     ok &= patch_file("VCamCore.m", cpr_old, cpr_new, "prerender-idle-0.5s")
     ok &= patch_file("LocalVideoPlayer.m", ld_old, ld_new, "decode-idle-0.5s")
-    # 5. GPUImageProcessor：先插 helper
-    try:
-        with open("GPUImageProcessor.m", "r", encoding="utf-8") as f:
-            content = f.read()
-        if "vcamApplyDestinationColorProps" in content:
-            print(">> 已应用过，跳过: GPUImageProcessor.m [helpers]")
-        elif gh_anchor not in content:
-            print("!! 未匹配: GPUImageProcessor.m [helpers]", file=sys.stderr)
-            ok = False
-        else:
-            content = content.replace(gh_anchor, gh_code, 1)
-            with open("GPUImageProcessor.m", "w", encoding="utf-8") as f:
-                f.write(content)
-            print(">> 已修改: GPUImageProcessor.m [helpers]")
-    except FileNotFoundError:
-        print("!! 文件不存在: GPUImageProcessor.m", file=sys.stderr)
-        ok = False
-    # 6. 中间 buffer 附件同步
-    ok &= patch_file("GPUImageProcessor.m", gr_old, gr_new, "rotate-attach")
-    ok &= patch_file("GPUImageProcessor.m", gm_old, gm_new, "mirror-attach")
-    ok &= patch_file("GPUImageProcessor.m", ga_old, ga_new, "adaptive-attach")
-    # 7. VT session Source/Destination
-    ok &= patch_file("GPUImageProcessor.m", gp_old, gp_new, "priv-lane")
-    ok &= patch_file("GPUImageProcessor.m", gs_old, gs_new, "std-lane")
-    ok &= patch_file("GPUImageProcessor.m", gn_old, gn_new, "normal-session")
+    # 拍照原彩：先插 helper，再改 hook
+    ok &= patch_file("Tweak.m", ph_helper_old, ph_helper_new, "photo-sdr-helper")
+    ok &= patch_file("Tweak.m", ph_hook_old, ph_hook_new, "photo-force-sdr")
 
     if not ok:
         print("!! apply_all 有未匹配项", file=sys.stderr)
