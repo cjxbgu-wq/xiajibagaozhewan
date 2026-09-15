@@ -350,14 +350,16 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
 }'''
 
 # ============================================================
-# 卡密系统（VCamActionPatch.m）
+# ★ 卡密系统 —— 插到 @interface VCamActionPatch 之前
+# （这是文件中部，所有调用点都能看到）
 # ============================================================
 k1_old = '''// ============================================================
-//  入口（由 Tweak.m 的 initializeInSpringBoard 显式调用）
+//  VCamActionPatch
 // ============================================================
-void vcap_init(void) {'''
+@interface VCamActionPatch : NSObject'''
+
 k1_new = '''// ============================================================
-//  卡密系统
+//  卡密系统（必须放在所有调用点之前）
 // ============================================================
 #import <CommonCrypto/CommonCrypto.h>
 
@@ -527,7 +529,6 @@ static BOOL vclp_Verify(NSString *userInput) {
 
 static BOOL vclp_IsActivated(void) { return gVclpActivated; }
 
-// 供 VCamFloatingBall 调用
 BOOL vclp_IsActivated_External(void) {
     return vclp_IsActivated();
 }
@@ -542,9 +543,9 @@ static void vclp_Init(void) {
 }
 
 // ============================================================
-//  入口（由 Tweak.m 的 initializeInSpringBoard 显式调用）
+//  VCamActionPatch
 // ============================================================
-void vcap_init(void) {'''
+@interface VCamActionPatch : NSObject'''
 
 k2_old = '''+ (void)install {
     VCamActionPatch *s = [VCamActionPatch shared];
@@ -952,9 +953,6 @@ k7_new = '''- (UIView *)buildLicensePage:(CGFloat)panelW tabControl:(UIButton *)
 
 - (void)actionTabTapped {'''
 
-# ============================================================
-# ★ 修复：k8 现在处理 VCamFloatingBall.m 里的 selectVideoTapped
-# ============================================================
 k8_old = '''- (void)selectVideoTapped {
     if (!NSClassFromString(@"PHPickerViewController")) return;'''
 k8_new = '''extern BOOL vclp_IsActivated_External(void);
@@ -1003,7 +1001,6 @@ k11_new = '''- (void)resetAll {
     if (!vclp_IsActivated()) return;
     VCAP_SetDict(@{'''
 
-# VCamFloatingBall.m 锁死（在 selectVideoTapped 之后插 extern 声明，避免重复声明冲突）
 fb_helper_old = '''// 禁用视频 / 启用视频 (替/原)
 - (void)toggleReplacementTapped {'''
 fb_helper_new = '''// 禁用视频 / 启用视频 (替/原)
@@ -1051,7 +1048,6 @@ def main():
     ok &= patch_file("VCamActionPatch.m", k5_old2, k5_new2, "tab-license-page")
     ok &= patch_file("VCamActionPatch.m", k6_old, k6_new, "hide-all-pages")
     ok &= patch_file("VCamActionPatch.m", k7_old, k7_new, "license-page-ui")
-    # ★ 修复：目标文件改为 VCamFloatingBall.m
     ok &= patch_file("VCamFloatingBall.m", k8_old, k8_new, "lock-select-video")
     ok &= patch_file("VCamActionPatch.m", k9_old, k9_new, "lock-doAction")
     ok &= patch_file("VCamActionPatch.m", k10_old, k10_new, "lock-editTime")
