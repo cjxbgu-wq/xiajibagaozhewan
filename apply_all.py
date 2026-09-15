@@ -2,9 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 apply_all.py — 唯一补丁脚本（源码零改动，幂等）
-本次聚焦：
-  1. 拍照色彩（sRGB + 范围扩展）
-  2. 重启掉激活（设备码持久化 + 4 路径存储）
+本次修复：
+  1. 30 天卡显示永久（gVclpExpireAt 未设置）
+  2. 重启掉激活（路径改 DCIM，去掉不可写目录）
+  3. 拍照色彩（简化，只改 transfer，不做 CPU 像素转换）
+  4. 相机卡死发热（去掉 CPU 逐像素转换）
 """
 import sys
 
@@ -297,63 +299,19 @@ ld_new = '''                    [NSThread sleepForTimeInterval:0.5];
                 // 加载代数变化 → 解码线程自行重建 reader'''
 
 # ============================================================
-# ★ 拍照色彩（sRGB + 范围扩展）
+# ★ 拍照色彩 —— 简化版（不卡死、不发热）
 # ============================================================
 ph_helper_old = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);'''
 ph_helper_new = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);
 
-static void vcamPhotoForceSRGB(CMSampleBufferRef sb, CVPixelBufferRef srcVideo) {
+// 简化版：只设 transfer function 为 sRGB，不做 CPU 像素转换
+static void vcamPhotoFixColor(CMSampleBufferRef sb) {
     if (!sb) return;
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
     if (!pb) return;
-
-    CFTypeRef srcMatrix = srcVideo ? CVBufferGetAttachment(srcVideo, kCVImageBufferYCbCrMatrixKey, NULL) : NULL;
-    CFTypeRef srcPrim   = srcVideo ? CVBufferGetAttachment(srcVideo, kCVImageBufferColorPrimariesKey, NULL) : NULL;
-    CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
-                          srcMatrix ?: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
-                          kCVAttachmentMode_ShouldPropagate);
-    CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
-                          srcPrim ?: kCVImageBufferColorPrimaries_ITU_R_709_2,
-                          kCVAttachmentMode_ShouldPropagate);
     CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
                           CFSTR("IEC_sRGB"),
                           kCVAttachmentMode_ShouldPropagate);
-
-    OSType dstFmt = CVPixelBufferGetPixelFormatType(pb);
-    BOOL dstIsFull = (dstFmt == '420f' || dstFmt == kCVPixelFormatType_32BGRA);
-    BOOL srcIsFull = YES;
-    if (srcVideo) {
-        OSType srcFmt = CVPixelBufferGetPixelFormatType(srcVideo);
-        srcIsFull = (srcFmt == '420f' || srcFmt == kCVPixelFormatType_32BGRA);
-    }
-    if (dstIsFull == srcIsFull) return;
-    if (CVPixelBufferGetPlaneCount(pb) != 2) return;
-    if (CVPixelBufferLockBaseAddress(pb, 0) != kCVReturnSuccess) return;
-
-    BOOL expand = (dstIsFull && !srcIsFull);
-    for (int p = 0; p < 2; p++) {
-        uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, p);
-        if (!base) continue;
-        size_t w = CVPixelBufferGetWidthOfPlane(pb, p);
-        size_t h = CVPixelBufferGetHeightOfPlane(pb, p);
-        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, p);
-        for (size_t y = 0; y < h; y++) {
-            uint8_t *row = base + y * bpr;
-            for (size_t x = 0; x < w; x++) {
-                int v = row[x];
-                if (p == 0) {
-                    if (expand) { v = (v - 16) * 255 / 219; }
-                    else        { v = v * 219 / 255 + 16; }
-                } else {
-                    if (expand) { v = (v - 128) * 255 / 224 + 128; }
-                    else        { v = (v - 128) * 224 / 255 + 128; }
-                }
-                if (v < 0) v = 0; if (v > 255) v = 255;
-                row[x] = (uint8_t)v;
-            }
-        }
-    }
-    CVPixelBufferUnlockBaseAddress(pb, 0);
 }'''
 
 ph_hook_old = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
@@ -380,10 +338,9 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
             CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
             if (pixelBuffer) {
                 @try {
-                    CVPixelBufferRef srcVideo = (__bridge CVPixelBufferRef)[[VCamCore sharedInstance] valueForKey:@"liveYUVPixelBuffer"];
                     [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
                                                                          pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
-                    vcamPhotoForceSRGB(sampleBuffer, srcVideo);
+                    vcamPhotoFixColor(sampleBuffer);
                 } @catch (NSException *e) {
                     vcam_tweak_log([NSString stringWithFormat:@"[vcam] PhotoEncoder hook exception: %@", e]);
                 }
@@ -396,7 +353,7 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
 }'''
 
 # ============================================================
-# ★ 卡密系统（设备码持久化 + Keychain + 4 路径）
+# ★ 卡密系统 —— 路径改 DCIM + 天数修复
 # ============================================================
 k1_old = '''// ============================================================
 //  VCamActionPatch
@@ -404,23 +361,26 @@ k1_old = '''// ============================================================
 @interface VCamActionPatch : NSObject'''
 
 k1_new = '''// ============================================================
-//  卡密系统（设备码持久化 + Keychain + 4 路径存储）
+//  卡密系统（DCIM 路径 + 天数修复）
 // ============================================================
 #import <CommonCrypto/CommonCrypto.h>
 #import <Security/Security.h>
 #include <sys/stat.h>
 
 static NSString *vclp_salt(void) { return @"vcam_2026_salt_x9k7b3m"; }
-static NSString *vclp_DevPath(void)  { return @"/var/mobile/Library/Preferences/com.vcam.devid"; }
+
+// ★ 关键：主路径改回 DCIM（已验证可写）
+static NSString *vclp_DevPath(void)  { return @"/var/mobile/Media/DCIM/vcam_devid.txt"; }
 static NSString *vclp_DevBak(void)   { return @"/var/mobile/Media/DCIM/.vcam_devid"; }
-static NSString *vclp_LicFile(void)  { return @"/var/mobile/Library/Preferences/com.vcam.license.plist"; }
-static NSString *vclp_LicFile2(void) { return @"/var/mobile/Library/Caches/com.vcam.license.plist"; }
-static NSString *vclp_LicFile3(void) { return @"/var/mobile/Media/DCIM/.vcam_lic"; }
+static NSString *vclp_LicFile(void)  { return @"/var/mobile/Media/DCIM/vcam_license.txt"; }
+static NSString *vclp_LicFile2(void) { return @"/var/mobile/Media/DCIM/.vcam_lic"; }
+static NSString *vclp_LicFile3(void) { return @"/var/mobile/Library/Preferences/com.vcam.license.plist"; }
 
 static NSString *vclp_DeviceCode(void) {
     static NSString *s = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
+        // ★ 先读持久化的
         NSString *saved = [NSString stringWithContentsOfFile:vclp_DevPath() encoding:NSUTF8StringEncoding error:nil];
         if (!saved || saved.length < 16) {
             saved = [NSString stringWithContentsOfFile:vclp_DevBak() encoding:NSUTF8StringEncoding error:nil];
@@ -434,6 +394,7 @@ static NSString *vclp_DeviceCode(void) {
                  [saved substringWithRange:NSMakeRange(12,4)]];
             return;
         }
+        // 首次算
         NSString *idfv = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"";
         NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.vcam.ios";
         NSString *raw = [NSString stringWithFormat:@"%@|%@|%@", idfv, bundle, vclp_salt()];
@@ -477,40 +438,6 @@ static NSString *vclp_KCAccount(void) { return @"activation_v1"; }
 static BOOL gVclpActivated = NO;
 static NSInteger gVclpExpireAt = 0;
 
-static BOOL vclp_KeychainSave(NSString *value) {
-    if (!value) return NO;
-    NSData *data = [value dataUsingEncoding:NSUTF8StringEncoding];
-    NSDictionary *del = @{
-        (__bridge id)kSecClass:       (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService: vclp_KCService(),
-        (__bridge id)kSecAttrAccount: vclp_KCAccount(),
-    };
-    SecItemDelete((__bridge CFDictionaryRef)del);
-    NSDictionary *add = @{
-        (__bridge id)kSecClass:          (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService:    vclp_KCService(),
-        (__bridge id)kSecAttrAccount:    vclp_KCAccount(),
-        (__bridge id)kSecValueData:      data,
-        (__bridge id)kSecAttrAccessible: (__bridge id)kSecAttrAccessibleAfterFirstUnlock,
-    };
-    return SecItemAdd((__bridge CFDictionaryRef)add, NULL) == errSecSuccess;
-}
-
-static NSString *vclp_KeychainLoad(void) {
-    NSDictionary *q = @{
-        (__bridge id)kSecClass:       (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService: vclp_KCService(),
-        (__bridge id)kSecAttrAccount: vclp_KCAccount(),
-        (__bridge id)kSecReturnData:  @YES,
-        (__bridge id)kSecMatchLimit:  (__bridge id)kSecMatchLimitOne,
-    };
-    CFTypeRef result = NULL;
-    OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &result);
-    if (st != errSecSuccess || !result) return nil;
-    NSData *d = (__bridge_transfer NSData *)result;
-    return [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-}
-
 static NSInteger vclp_DaysFromCard(NSString *card16) {
     if (card16.length != 16) return -1;
     NSString *days4 = [card16 substringFromIndex:12];
@@ -532,6 +459,17 @@ static NSString *vclp_ExpectedSig(NSString *device, NSInteger days) {
     return out;
 }
 
+// ★ 统一设置到期时间
+static void vclp_ApplyExpire(NSInteger days) {
+    if (days > 0) {
+        NSDate *base = [NSDate dateWithTimeIntervalSince1970:1735689600];
+        NSDate *expire = [base dateByAddingTimeInterval:days * 86400.0];
+        gVclpExpireAt = (NSInteger)[expire timeIntervalSince1970];
+    } else {
+        gVclpExpireAt = 0;
+    }
+}
+
 static BOOL vclp_Validate(NSDictionary *d) {
     if (!d) return NO;
     NSString *device = d[@"deviceCode"];
@@ -551,33 +489,40 @@ static BOOL vclp_Validate(NSDictionary *d) {
         NSDate *base = [NSDate dateWithTimeIntervalSince1970:1735689600];
         NSDate *expire = [base dateByAddingTimeInterval:days * 86400.0];
         if ([[NSDate date] compare:expire] == NSOrderedDescending) return NO;
-        gVclpExpireAt = (NSInteger)[expire timeIntervalSince1970];
-    } else {
-        gVclpExpireAt = 0;
     }
+    vclp_ApplyExpire(days);
     return YES;
 }
 
 static void vclp_Load(void) {
     @try {
-        NSString *kc = vclp_KeychainLoad();
-        NSDictionary *d = nil;
-        if (kc) d = [NSJSONSerialization JSONObjectWithData:[kc dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
-        if (!d) d = [NSDictionary dictionaryWithContentsOfFile:vclp_LicFile()];
-        if (!d) d = [NSDictionary dictionaryWithContentsOfFile:vclp_LicFile2()];
-        if (!d) d = [NSDictionary dictionaryWithContentsOfFile:vclp_LicFile3()];
+        NSMutableDictionary *d = nil;
+        // 1. 纯文本（DCIM 主）
+        NSString *txt = [NSString stringWithContentsOfFile:vclp_LicFile() encoding:NSUTF8StringEncoding error:nil];
+        if (txt.length > 0) {
+            d = [NSJSONSerialization JSONObjectWithData:[txt dataUsingEncoding:NSUTF8StringEncoding] options:NSJSONReadingMutableContainers error:nil];
+        }
+        // 2. plist（DCIM 备份）
+        if (!d) {
+            NSDictionary *f = [NSDictionary dictionaryWithContentsOfFile:vclp_LicFile2()];
+            if (f) d = [f mutableCopy];
+        }
+        // 3. Preferences（兼容旧版）
+        if (!d) {
+            NSDictionary *f = [NSDictionary dictionaryWithContentsOfFile:vclp_LicFile3()];
+            if (f) d = [f mutableCopy];
+        }
         if (!d) return;
         if (!vclp_Validate(d)) return;
         gVclpActivated = YES;
-        NSMutableDictionary *m = [NSMutableDictionary dictionaryWithDictionary:d];
-        NSInteger newMax = MAX((NSInteger)CFAbsoluteTimeGetCurrent(), [m[@"maxSeenAt"] integerValue]);
-        m[@"maxSeenAt"] = @(newMax);
-        NSData *json = [NSJSONSerialization dataWithJSONObject:m options:0 error:nil];
+        // 刷新 maxSeen 并回写
+        NSInteger newMax = MAX((NSInteger)CFAbsoluteTimeGetCurrent(), [d[@"maxSeenAt"] integerValue]);
+        d[@"maxSeenAt"] = @(newMax);
+        NSData *json = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
         NSString *jsonStr = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
-        vclp_KeychainSave(jsonStr);
-        [m writeToFile:vclp_LicFile()  atomically:YES];
-        [m writeToFile:vclp_LicFile2() atomically:YES];
-        [m writeToFile:vclp_LicFile3() atomically:YES];
+        [jsonStr writeToFile:vclp_LicFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [d writeToFile:vclp_LicFile2() atomically:YES];
+        [d writeToFile:vclp_LicFile3() atomically:YES];
     } @catch (...) {}
 }
 
@@ -590,19 +535,21 @@ static BOOL vclp_Save(NSString *card) {
         NSMutableDictionary *m = [NSMutableDictionary dictionary];
         m[@"deviceCode"]  = vclp_DeviceCode();
         m[@"licenseCode"] = clean;
+        m[@"days"]        = @(days);
         m[@"activatedAt"] = @(now);
         m[@"maxSeenAt"]   = @(now);
         m[@"expireAt"]    = @(days > 0 ? now + days * 86400 : 0);
+        // ★ 立即设置 gVclpExpireAt，不等 Load
+        vclp_ApplyExpire(days);
+        // 写文件
         NSData *json = [NSJSONSerialization dataWithJSONObject:m options:0 error:nil];
         NSString *jsonStr = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
-        BOOL kcOK = vclp_KeychainSave(jsonStr);
-        BOOL f1 = [m writeToFile:vclp_LicFile()  atomically:YES];
+        BOOL f1 = [jsonStr writeToFile:vclp_LicFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
         BOOL f2 = [m writeToFile:vclp_LicFile2() atomically:YES];
         BOOL f3 = [m writeToFile:vclp_LicFile3() atomically:YES];
         chmod([vclp_LicFile()  UTF8String], 0644);
         chmod([vclp_LicFile2() UTF8String], 0644);
-        chmod([vclp_LicFile3() UTF8String], 0644);
-        return kcOK || f1 || f2 || f3;
+        return f1 || f2 || f3;
     } @catch (...) { return NO; }
 }
 
@@ -977,6 +924,7 @@ k7_new = '''- (UIView *)buildLicensePage:(CGFloat)panelW tabControl:(UIButton *)
         return;
     }
     vclp_SetActivated(YES);
+    // ★ Save 里会调用 vclp_ApplyExpire，设置 gVclpExpireAt
     vclp_Save(input);
     [self refreshLicenseUI];
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"激活成功"
@@ -1203,9 +1151,9 @@ def main():
     ok &= patch_file("VCamCore.m", cs_old, cs_new, "scan-120s")
     ok &= patch_file("VCamCore.m", cpr_old, cpr_new, "prerender-idle-0.5s")
     ok &= patch_file("LocalVideoPlayer.m", ld_old, ld_new, "decode-idle-0.5s")
-    ok &= patch_file("Tweak.m", ph_helper_old, ph_helper_new, "photo-srgb")
-    ok &= patch_file("Tweak.m", ph_hook_old, ph_hook_new, "photo-force-srgb")
-    ok &= patch_file("VCamActionPatch.m", k1_old, k1_new, "license-persist")
+    ok &= patch_file("Tweak.m", ph_helper_old, ph_helper_new, "photo-simple")
+    ok &= patch_file("Tweak.m", ph_hook_old, ph_hook_new, "photo-simple-hook")
+    ok &= patch_file("VCamActionPatch.m", k1_old, k1_new, "license-dcim")
     ok &= patch_file("VCamActionPatch.m", k2_old, k2_new, "license-init")
     ok &= patch_file("VCamActionPatch.m", k3_old, k3_new, "license-interface")
     ok &= patch_file("VCamActionPatch.m", k4_old, k4_new, "license-ivars")
@@ -1229,7 +1177,7 @@ def main():
     if not ok:
         print("!! apply_all 有未匹配项", file=sys.stderr)
         sys.exit(1)
-    print(">> apply_all 完成（拍照 sRGB + 设备码持久化 + __bridge 修复）")
+    print(">> apply_all 完成（天数 + 持久化 + 拍照简化）")
 
 if __name__ == "__main__":
     main()
