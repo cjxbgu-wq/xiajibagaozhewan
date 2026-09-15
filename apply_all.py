@@ -6,14 +6,12 @@ apply_all.py — 唯一补丁脚本（源码零改动，幂等）
 包含全部修复：
   [编译]   VCamCore.m 962 行语法
   [问题1]  换视频残留
-  [问题2]  拍照色彩 sRGB
   [发热1]  VcamFix 反射缓存 + timer 合并
   [发热2]  禁用 CPU 绿色边缘 crop
-  [卡死]   禁用 PLAYER STUCK 自愈
+  [卡死]   禁用 PLAYER STUCK 自愈 + 拍照 hook 空转
   [卡顿]   轮询/空闲 sleep 拉长
-  [卡密1]  一机一码 + 三 tab + 锁死
-  [卡密2]  设备码每次读文件
-  [卡密3]  vclp_Load 日志 + 长重试 + 切页重载
+  [拍照]   方案 B：预渲染线程写 JPEG + Hook PHAssetCreationRequest 替换相册写入
+  [卡密]   一机一码 + 三 tab + 锁死 + 设备码每次读文件 + 长重试
 """
 import sys
 
@@ -110,7 +108,7 @@ vf_new = '''        if (gLastActivePath == nil) {
 
 
 # ============================================================
-# [3] VcamFix.m — CoreClass 缓存
+# [3-4] VcamFix.m — 类缓存
 # ============================================================
 vc_old = '''static Class VcamFix_CoreClass(void) {
     Class c = NSClassFromString(@"Qz1");
@@ -125,10 +123,6 @@ vc_new = '''static Class VcamFix_CoreClass(void) {
     return c;
 }'''
 
-
-# ============================================================
-# [4] VcamFix.m — BallClass 缓存
-# ============================================================
 vb_old = '''static Class VcamFix_BallClass(void) {
     Class c = NSClassFromString(@"Jx6");
     return c ?: NSClassFromString(@"VCamFloatingBall");
@@ -270,7 +264,6 @@ vs_new = '''static void VcamFix_SyncEnabled(void) {
         VcamFix_Log([NSString stringWithFormat:@"setEnabled:%d", (int)plistEn]);
         return;
     }
-    // ★ 已删除 PLAYER STUCK 强制自愈（误判打断正常播放）
 }'''
 
 
@@ -360,7 +353,6 @@ f1_old = '''static BOOL VcamFix_transfer(id self, SEL _cmd, CVPixelBufferRef src
         return gOrig_transfer ? gOrig_transfer(self, _cmd, src, dst, token) : NO;
     }'''
 f1_new = '''static BOOL VcamFix_transfer(id self, SEL _cmd, CVPixelBufferRef src, CVPixelBufferRef dst, uint64_t token) {
-    // ★ 完全移除 CPU green-edge crop（发热/卡死根因）
     return gOrig_transfer ? gOrig_transfer(self, _cmd, src, dst, token) : NO;
 }
 
@@ -373,22 +365,14 @@ static BOOL VcamFix_transfer_legacy(id self, SEL _cmd, CVPixelBufferRef src, CVP
 
 
 # ============================================================
-# [10] VCamCore.m — 轮询 0.15s → 0.5s
+# [10-13] VCamCore.m / LocalVideoPlayer.m — 卡顿
 # ============================================================
 cp_old = '''    [[VCamNotify sharedInstance] startPollingWithInterval:0.15 callback:^(BOOL enabled) {'''
 cp_new = '''    [[VCamNotify sharedInstance] startPollingWithInterval:0.5 callback:^(BOOL enabled) {'''
 
-
-# ============================================================
-# [11] VCamCore.m — 反注入扫描 30s → 120s
-# ============================================================
 cs_old = '''    if (snapshot && now - lastScan < 30.0) return lastRes;'''
 cs_new = '''    if (snapshot && now - lastScan < 120.0) return lastRes;'''
 
-
-# ============================================================
-# [12] VCamCore.m — prerender 空闲 sleep 0.1 → 0.5
-# ============================================================
 cpr_old = '''                if (strongSelf.pipelineIdle) {
                     [NSThread sleepForTimeInterval:0.1];
                     nextTick = CFAbsoluteTimeGetCurrent();
@@ -400,10 +384,6 @@ cpr_new = '''                if (strongSelf.pipelineIdle) {
                     continue;
                 }'''
 
-
-# ============================================================
-# [13] LocalVideoPlayer.m — decodeLoop 空闲 sleep 0.1 → 0.5
-# ============================================================
 ld_old = '''                    [NSThread sleepForTimeInterval:0.1];
                     continue;
                 }
@@ -417,28 +397,16 @@ ld_new = '''                    [NSThread sleepForTimeInterval:0.5];
 
 
 # ============================================================
-# [14] Tweak.m — 拍照 sRGB
+# [14] Tweak.m — 声明 orig + 新增 orig_addResource
 # ============================================================
 ph_helper_old = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);'''
 ph_helper_new = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);
+static void (*orig_addResource)(id self, SEL _cmd, NSInteger type, NSData *data, id options) = NULL;'''
 
-static void vcamPhotoForceSRGB(CMSampleBufferRef sb, CVPixelBufferRef srcVideo) {
-    if (!sb) return;
-    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
-    if (!pb) return;
-    CFTypeRef srcMatrix = srcVideo ? CVBufferGetAttachment(srcVideo, kCVImageBufferYCbCrMatrixKey, NULL) : NULL;
-    CFTypeRef srcPrim   = srcVideo ? CVBufferGetAttachment(srcVideo, kCVImageBufferColorPrimariesKey, NULL) : NULL;
-    CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
-                          srcMatrix ?: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
-                          kCVAttachmentMode_ShouldPropagate);
-    CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
-                          srcPrim ?: kCVImageBufferColorPrimaries_ITU_R_709_2,
-                          kCVAttachmentMode_ShouldPropagate);
-    CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
-                          CFSTR("IEC_sRGB"),
-                          kCVAttachmentMode_ShouldPropagate);
-}'''
 
+# ============================================================
+# [15] Tweak.m — 拍照 hook 空转
+# ============================================================
 ph_hook_old = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
     if (sampleBuffer) {
         @autoreleasepool {
@@ -458,21 +426,7 @@ ph_hook_old = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
     }
 }'''
 ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
-    if (sampleBuffer) {
-        @autoreleasepool {
-            CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-            if (pixelBuffer) {
-                @try {
-                    CVPixelBufferRef srcVideo = (__bridge CVPixelBufferRef)[[VCamCore sharedInstance] valueForKey:@"liveYUVPixelBuffer"];
-                    [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
-                                                                         pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
-                    vcamPhotoForceSRGB(sampleBuffer, srcVideo);
-                } @catch (NSException *e) {
-                    vcam_tweak_log([NSString stringWithFormat:@"[vcam] PhotoEncoder hook exception: %@", e]);
-                }
-            }
-        }
-    }
+    // 拍照 hook 空转：相机管线完全不动，避免 Watchdog 杀 mediaserverd
     if (orig_BWPhotoEncoderNode_renderSampleBuffer) {
         orig_BWPhotoEncoderNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
     }
@@ -480,7 +434,123 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
 
 
 # ============================================================
-# [15] VCamActionPatch.m — 卡密系统（含 fix8 全部修复）
+# [16] VCamCore.m — prerender 线程每 5 帧写 JPEG
+# ============================================================
+vc_jpeg_old = '''                [strongSelf.processLock lock];
+                if (strongSelf->_liveYUVPixelBuffer) {
+                    CVPixelBufferRelease(strongSelf->_liveYUVPixelBuffer);
+                }
+                strongSelf->_liveYUVPixelBuffer = baked;
+                strongSelf->_liveFrameGen++;
+                [strongSelf.processLock unlock];
+            }
+        }
+    });
+}'''
+vc_jpeg_new = '''                [strongSelf.processLock lock];
+                if (strongSelf->_liveYUVPixelBuffer) {
+                    CVPixelBufferRelease(strongSelf->_liveYUVPixelBuffer);
+                }
+                strongSelf->_liveYUVPixelBuffer = baked;
+                strongSelf->_liveFrameGen++;
+                [strongSelf.processLock unlock];
+
+                // 拍照原彩：每 5 帧把当前帧写 JPEG 到共享文件
+                static int sJpegCounter = 0;
+                if (++sJpegCounter % 5 == 0) {
+                    CVPixelBufferRef snap = CVPixelBufferRetain(baked);
+                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                        @autoreleasepool {
+                            if (!snap) return;
+                            CIImage *ci = [CIImage imageWithCVPixelBuffer:snap];
+                            if (ci) {
+                                CIContext *ctx = [CIContext contextWithOptions:nil];
+                                CGImageRef cg = [ctx createCGImage:ci fromRect:ci.extent];
+                                if (cg) {
+                                    NSMutableData *jpg = [NSMutableData data];
+                                    CGImageDestinationRef dest = CGImageDestinationCreateWithData(
+                                        (__bridge CFMutableDataRef)jpg,
+                                        CFSTR("public.jpeg"), 1, NULL);
+                                    if (dest) {
+                                        CGImageDestinationAddImage(dest, cg, NULL);
+                                        CGImageDestinationFinalize(dest);
+                                        CFRelease(dest);
+                                        [jpg writeToFile:@"/var/mobile/Media/DCIM/.vcam_current.jpg" atomically:YES];
+                                    }
+                                    CGImageRelease(cg);
+                                }
+                            }
+                            CVPixelBufferRelease(snap);
+                        }
+                    });
+                }
+            }
+        }
+    });
+}'''
+
+
+# ============================================================
+# [17] Tweak.m — Hook PHAssetCreationRequest
+# ============================================================
+ph_asset_old = '''#pragma mark - 入口'''
+ph_asset_new = '''#pragma mark - Hook 5: PHAssetCreationRequest（拍照替换）
+
+static void hook_addResourceWithType(id self, SEL _cmd, NSInteger type, NSData *data, id options) {
+    // PHAssetResourceTypePhoto = 1, FullSizePhoto = 5
+    if (type == 1 || type == 5) {
+        NSData *replacement = [NSData dataWithContentsOfFile:@"/var/mobile/Media/DCIM/.vcam_current.jpg"];
+        if (replacement.length > 100) {
+            vcam_tweak_log([NSString stringWithFormat:@"[vcam] photo replaced: %lu -> %lu bytes",
+                            (unsigned long)data.length, (unsigned long)replacement.length]);
+            data = replacement;
+        }
+    }
+    if (orig_addResource) orig_addResource(self, _cmd, type, data, options);
+}
+
+static void vcamInstallPHAssetHook(void) {
+    Class cls = NSClassFromString(@"PHAssetCreationRequest");
+    if (!cls) {
+        vcam_tweak_log(@"[vcam] PHAssetCreationRequest class not found");
+        return;
+    }
+    SEL sel = NSSelectorFromString(@"addResourceWithType:data:options:");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (m) {
+        orig_addResource = (void (*)(id, SEL, NSInteger, NSData *, id))method_getImplementation(m);
+        method_setImplementation(m, (IMP)hook_addResourceWithType);
+        vcam_tweak_log(@"[vcam] Hooked PHAssetCreationRequest.addResourceWithType");
+    } else {
+        vcam_tweak_log(@"[vcam] addResourceWithType:data:options: method not found");
+    }
+}
+
+#pragma mark - 入口'''
+
+
+# ============================================================
+# [18] Tweak.m — SpringBoard 初始化时安装 PHAsset hook
+# ============================================================
+ph_init_old = '''static void initializeInSpringBoard(void) {
+    vcam_tweak_log(@"[vcam] Initializing in SpringBoard...");
+    [[VCamCore sharedInstance] initializeInSpringBoard];
+    [[VCamFloatingBall sharedInstance] showFloatingBall];
+    vchp_init();
+    vcap_init();
+}'''
+ph_init_new = '''static void initializeInSpringBoard(void) {
+    vcam_tweak_log(@"[vcam] Initializing in SpringBoard...");
+    [[VCamCore sharedInstance] initializeInSpringBoard];
+    [[VCamFloatingBall sharedInstance] showFloatingBall];
+    vchp_init();
+    vcap_init();
+    vcamInstallPHAssetHook();
+}'''
+
+
+# ============================================================
+# [19] VCamActionPatch.m — 卡密系统
 # ============================================================
 k1_old = '''// ============================================================
 //  VCamActionPatch
@@ -498,7 +568,6 @@ static NSString *vclp_DevPath(void)  { return @"/var/mobile/Media/DCIM/vcam_devi
 static NSString *vclp_DevBak(void)   { return @"/var/mobile/Media/DCIM/.vcam_devid"; }
 static NSString *vclp_LicPath(void)  { return @"/var/mobile/Media/DCIM/vcam_license.plist"; }
 
-// ★ 设备码：每次读文件，无 dispatch_once 缓存
 static NSString *vclp_DeviceCode(void) {
     NSString *raw = [NSString stringWithContentsOfFile:vclp_DevPath() encoding:NSUTF8StringEncoding error:nil];
     if (!raw || raw.length < 16) {
@@ -610,7 +679,6 @@ static BOOL vclp_Validate(NSDictionary *d) {
     return YES;
 }
 
-// ★ vclp_Load 加日志
 static void vclp_Load(void) {
     @try {
         NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:vclp_LicPath()];
@@ -668,7 +736,6 @@ BOOL vclp_IsActivated_External(void) {
     return vclp_IsActivated();
 }
 
-// ★ vclp_Init 长重试
 static void vclp_Init(void) {
     vclp_Load();
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1045,7 +1112,6 @@ k7_new = '''- (UIView *)buildLicensePage:(CGFloat)panelW tabControl:(UIButton *)
     if (root) [root presentViewController:a animated:YES completion:nil];
 }
 
-// ★ licenseTabTapped 主动 reload
 - (void)licenseTabTapped {
     vclp_Load();
     id ball = VCAP_FindBallInstance();
@@ -1153,7 +1219,7 @@ k12_new = '''- (void)actionTabTapped {
 
 
 # ============================================================
-# [16] VCamFloatingBall.m — 控制页锁死
+# [20] VCamFloatingBall.m — 控制页锁死
 # ============================================================
 fb_helper_old = '''// 禁用视频 / 启用视频 (替/原)
 - (void)toggleReplacementTapped {'''
@@ -1181,7 +1247,7 @@ fb_zout_new = '''- (void)zoomOutTapped {
 
 
 # ============================================================
-# [17] VCamFloatingBall.m — cellH 52 → 42
+# [21] VCamFloatingBall.m — cellH 52 → 42
 # ============================================================
 cell_old = "CGFloat cellH = 52;"
 cell_new = "CGFloat cellH = 42;"
@@ -1194,21 +1260,24 @@ def main():
     ok &= patch_file("VcamFix.m", vc_old, vc_new, "cache-core-class")
     ok &= patch_file("VcamFix.m", vb_old, vb_new, "cache-ball-class")
     ok &= patch_file("VcamFix.m", vr_old, vr_new, "read-enabled-mtime")
-    ok &= patch_file("VcamFix.m", vs_old, vs_new, "syncenabled-ivar-cache")
+    ok &= patch_file("VcamFix.m", vs_old, vs_new, "syncenabled-cleanup")
     ok &= patch_file("VcamFix.m", vt_old, vt_new, "merge-timers")
     ok &= patch_file("VcamFix.m", hb_old, hb_new, "hidebtn-size")
     ok &= patch_file("VcamFix.m", f1_old, f1_new, "disable-cpu-crop")
     ok &= patch_file("VCamCore.m", cp_old, cp_new, "polling-0.5s")
     ok &= patch_file("VCamCore.m", cs_old, cs_new, "scan-120s")
     ok &= patch_file("VCamCore.m", cpr_old, cpr_new, "prerender-idle-0.5s")
+    ok &= patch_file("VCamCore.m", vc_jpeg_old, vc_jpeg_new, "prerender-write-jpeg")
     ok &= patch_file("LocalVideoPlayer.m", ld_old, ld_new, "decode-idle-0.5s")
-    ok &= patch_file("Tweak.m", ph_helper_old, ph_helper_new, "photo-srgb")
-    ok &= patch_file("Tweak.m", ph_hook_old, ph_hook_new, "photo-force-srgb")
+    ok &= patch_file("Tweak.m", ph_helper_old, ph_helper_new, "helper+phasset")
+    ok &= patch_file("Tweak.m", ph_hook_old, ph_hook_new, "photo-hook-noop")
+    ok &= patch_file("Tweak.m", ph_asset_old, ph_asset_new, "hook-phasset")
+    ok &= patch_file("Tweak.m", ph_init_old, ph_init_new, "install-phasset-hook")
     ok &= patch_file("VCamActionPatch.m", k1_old, k1_new, "license-core")
     ok &= patch_file("VCamActionPatch.m", k2_old, k2_new, "license-init")
     ok &= patch_file("VCamActionPatch.m", k3_old, k3_new, "license-interface")
     ok &= patch_file("VCamActionPatch.m", k4_old, k4_new, "license-ivars")
-    ok &= patch_file("VCamActionPatch.m", k5_old, k5_new, "tab-3width-noexpand")
+    ok &= patch_file("VCamActionPatch.m", k5_old, k5_new, "tab-3width")
     ok &= patch_file("VCamActionPatch.m", k5_old2, k5_new2, "tab-license-page")
     ok &= patch_file("VCamActionPatch.m", k6_old, k6_new, "hide-all-pages")
     ok &= patch_file("VCamActionPatch.m", k7_old, k7_new, "license-page-ui")
