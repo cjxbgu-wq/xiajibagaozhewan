@@ -1,21 +1,26 @@
 //
-//  VcamFix.m — 4 个问题的补丁实现（源码零改动）
+//  VcamFix.m — 精简版补丁
+//
+//  保留:
+//    - 门禁刷 + 播放器状态自愈 (视频播放)
+//    - 强制 plist decodeMaxEdge=0 (不压缩)
+//    - VCamHidePatch (三指呼出 + hideBtn)
+//    - 控制 tab 切回
+//
+//  撤掉:
+//    - swizzle transferPixelBuffer: (绿边修复已进 GPUImageProcessor.m 本体)
+//    - swizzle loadVideoAtPath: (无效且干扰源码 reload)
+//    - 动作 token 检测 (导致画面抖动)
 //
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#include <notify.h>
 #import "VCamNotify.h"
 
-// 手动声明 VT
-typedef struct OpaqueVTPixelTransferSession *VTPixelTransferSessionRef;
-extern OSStatus VTPixelTransferSessionTransferImage(VTPixelTransferSessionRef, CVPixelBufferRef, CVPixelBufferRef);
-
-static dispatch_source_t gTimerMD  = nil;
-static dispatch_source_t gTimerSB  = nil;
-static dispatch_source_t gTimerTok = nil;
+static dispatch_source_t gTimerMD = nil;
+static dispatch_source_t gTimerSB = nil;
 
 #pragma mark - 日志
 
@@ -73,7 +78,7 @@ static BOOL VcamFix_ReadEnabled(void) {
     return NO;
 }
 
-#pragma mark - 问题 1: 强制关闭降采样
+#pragma mark - 强制关闭降采样
 
 __attribute__((constructor, used))
 static void VcamFixEarlyInit(void) {
@@ -90,111 +95,6 @@ static void VcamFixEarlyInit(void) {
             VcamFix_Log([NSString stringWithFormat:@"decodeMaxEdge forced to 0 (was %ld)", (long)cur]);
         }
     }
-}
-
-#pragma mark - 问题 3: 换视频清缓存
-
-static void VcamFix_ClearLiveBuffers(void) {
-    Class coreCls = VcamFix_CoreClass();
-    if (!coreCls) return;
-    id core = VcamFix_CoreInstance();
-    if (!core) return;
-    uint8_t *base = (uint8_t *)(__bridge void *)core;
-
-    NSLock *pLock = nil;
-    @try { pLock = [core valueForKey:@"processLock"]; } @catch (...) {}
-    NSLock *rLock = nil;
-    @try { rLock = [core valueForKey:@"renderLock"]; } @catch (...) {}
-
-    if (pLock) [pLock lock];
-    const char *ivars[] = {"_liveYUVPixelBuffer", "_liveBGRAPixelBuffer", "_syncDisplayFrame", NULL};
-    for (int i = 0; ivars[i]; i++) {
-        Ivar iv = class_getInstanceVariable(coreCls, ivars[i]);
-        if (!iv) continue;
-        CVPixelBufferRef b = *(CVPixelBufferRef *)(base + ivar_getOffset(iv));
-        if (b) {
-            CVPixelBufferRelease(b);
-            *(CVPixelBufferRef *)(base + ivar_getOffset(iv)) = NULL;
-        }
-    }
-    if (pLock) [pLock unlock];
-
-    if (rLock) [rLock lock];
-    Ivar ivFb = class_getInstanceVariable(coreCls, "_fallbackFrame");
-    if (ivFb) {
-        CVPixelBufferRef fb = *(CVPixelBufferRef *)(base + ivar_getOffset(ivFb));
-        if (fb) {
-            CVPixelBufferRelease(fb);
-            *(CVPixelBufferRef *)(base + ivar_getOffset(ivFb)) = NULL;
-        }
-    }
-    if (rLock) [rLock unlock];
-}
-
-static void (*gOrig_loadVideo)(id, SEL, NSString *, id) = NULL;
-static void VcamFix_loadVideo(id self, SEL _cmd, NSString *path, id completion) {
-    VcamFix_Log([NSString stringWithFormat:@"loadVideoAtPath: %@", path.lastPathComponent]);
-    VcamFix_ClearLiveBuffers();
-    if (gOrig_loadVideo) gOrig_loadVideo(self, _cmd, path, completion);
-}
-
-#pragma mark - 问题 2: 绿边修复
-
-// ★ 修正: 返回类型必须是 BOOL (与 GPUImageProcessor.h 里声明一致)
-static BOOL (*gOrig_transfer)(id, SEL, CVPixelBufferRef, CVPixelBufferRef, uint64_t) = NULL;
-
-static BOOL VcamFix_PrivateLaneFix(id self, CVPixelBufferRef src, CVPixelBufferRef dst, uint64_t token) {
-    if (!src || !dst) return NO;
-    OSType dstFmt = CVPixelBufferGetPixelFormatType(dst);
-    BOOL isStd = (dstFmt == kCVPixelFormatType_32BGRA ||
-                  dstFmt == '420f' || dstFmt == '420v' ||
-                  dstFmt == 0x70343230);
-    if (isStd) return NO;
-
-    size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
-    size_t dstW = CVPixelBufferGetWidth(dst), dstH = CVPixelBufferGetHeight(dst);
-    if (!srcW || !srcH || !dstW || !dstH) return NO;
-
-    double sc = MAX((double)dstW / srcW, (double)dstH / srcH);
-    double cropW = srcW * sc - dstW;
-    double cropH = srcH * sc - dstH;
-    BOOL fixH = NO, fixV = NO;
-    if (cropW > 0.5) { double o = cropW / 2.0; fixH = (fabs(o - floor(o + 0.5)) > 1e-3); }
-    if (cropH > 0.5) { double o = cropH / 2.0; fixV = (fabs(o - floor(o + 0.5)) > 1e-3); }
-    if (!fixH && !fixV) return NO;
-
-    SEL sCrop = NSSelectorFromString(@"cropStagingForRatio:dst:srcToken:");
-    SEL sNorm = NSSelectorFromString(@"normalTransferSession");
-    if (![self respondsToSelector:sCrop] || ![self respondsToSelector:sNorm]) return NO;
-
-    NSLock *laneLock = nil;
-    @try { laneLock = [self valueForKey:@"laneLockPrivate"]; } @catch (...) {}
-    if (laneLock) [laneLock lock];
-
-    BOOL ok = NO;
-    CVPixelBufferRef cropped = ((CVPixelBufferRef(*)(id,SEL,CVPixelBufferRef,CVPixelBufferRef,uint64_t))
-                                [self methodForSelector:sCrop])(self, sCrop, src, dst, token);
-    if (cropped) {
-        VTPixelTransferSessionRef ns = ((VTPixelTransferSessionRef(*)(id,SEL))
-                                        [self methodForSelector:sNorm])(self, sNorm);
-        if (ns && VTPixelTransferSessionTransferImage(ns, cropped, dst) == noErr) {
-            ok = YES;
-            static CFAbsoluteTime lastLog = 0;
-            CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-            if (now - lastLog > 5.0) {
-                lastLog = now;
-                VcamFix_Log(@"[fix] green-edge fixed (pre-crop + normal session)");
-            }
-        }
-    }
-    if (laneLock) [laneLock unlock];
-    return ok;
-}
-
-static BOOL VcamFix_transfer(id self, SEL _cmd, CVPixelBufferRef src, CVPixelBufferRef dst, uint64_t token) {
-    if (VcamFix_PrivateLaneFix(self, src, dst, token)) return YES;
-    if (gOrig_transfer) return gOrig_transfer(self, _cmd, src, dst, token);
-    return NO;
 }
 
 #pragma mark - 门禁 + 播放器状态自愈
@@ -265,20 +165,6 @@ static void VcamFix_SyncEnabled(void) {
     lastFc = fc;
 }
 
-#pragma mark - 问题 4: 动作延迟
-
-static void VcamFix_ActionTick(void) {
-    static NSInteger lastTok = -1;
-    @try {
-        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:VcamFix_PlistPath()];
-        if (!d) return;
-        NSInteger tok = [d[@"actionToken"] integerValue];
-        if (tok == lastTok) return;
-        lastTok = tok;
-        notify_post("com.gouchun.action");
-    } @catch (...) {}
-}
-
 #pragma mark - render 入口刷门禁
 
 static void (*gOrig_render)(id, SEL, CVPixelBufferRef, double) = NULL;
@@ -298,7 +184,7 @@ static void VcamFix_render(id self, SEL _cmd, CVPixelBufferRef pb, double pts) {
     if (gOrig_render) gOrig_render(self, _cmd, pb, pts);
 }
 
-#pragma mark - VCamHidePatch
+#pragma mark - VCamHidePatch (三指呼出 + hideBtn)
 
 static void VcamFix_hideBall(Class self, SEL _cmd) {
     @try {
@@ -317,6 +203,7 @@ static void VcamFix_hideBall(Class self, SEL _cmd) {
         [ball setValue:@NO forKey:@"panelVisible"];
     } @catch (...) {}
 }
+
 static void VcamFix_showBall(Class self, SEL _cmd) {
     @try {
         NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:VcamFix_PlistPath()];
@@ -331,6 +218,7 @@ static void VcamFix_showBall(Class self, SEL _cmd) {
         if (bv) bv.hidden = NO;
     } @catch (...) {}
 }
+
 static void VcamFix_pollHide(Class self, SEL _cmd) {
     static BOOL injected = NO;
     if (injected) return;
@@ -387,12 +275,13 @@ static void VcamFix_pollHide(Class self, SEL _cmd) {
     injected = YES;
 }
 
-#pragma mark - 控制 tab
+#pragma mark - 控制 tab 切回
 
 @interface VcamFixCtrlTarget : NSObject
 + (instancetype)shared;
 - (void)controlTabTapped:(id)sender;
 @end
+
 @implementation VcamFixCtrlTarget
 + (instancetype)shared {
     static VcamFixCtrlTarget *inst = nil;
@@ -456,32 +345,14 @@ static void VcamFixInit(void) {
         if (isMd || isLskdd) {
             VcamFix_Log([NSString stringWithFormat:@"md init pid=%d", getpid()]);
 
+            // swizzle renderReplacementToPixelBuffer:pts: 刷门禁
             Class coreCls = VcamFix_CoreClass();
             if (coreCls) {
-                Method mr = class_getInstanceMethod(coreCls, NSSelectorFromString(@"renderReplacementToPixelBuffer:pts:"));
+                Method mr = class_getInstanceMethod(coreCls,
+                    NSSelectorFromString(@"renderReplacementToPixelBuffer:pts:"));
                 if (mr) {
                     gOrig_render = (void (*)(id,SEL,CVPixelBufferRef,double))method_getImplementation(mr);
                     method_setImplementation(mr, (IMP)VcamFix_render);
-                }
-            }
-            Class playerCls = NSClassFromString(@"Wv2");
-            if (!playerCls) playerCls = NSClassFromString(@"LocalVideoPlayer");
-            if (playerCls) {
-                Method ml = class_getInstanceMethod(playerCls, NSSelectorFromString(@"loadVideoAtPath:completion:"));
-                if (ml) {
-                    gOrig_loadVideo = (void (*)(id,SEL,NSString*,id))method_getImplementation(ml);
-                    method_setImplementation(ml, (IMP)VcamFix_loadVideo);
-                    VcamFix_Log(@"swizzled loadVideoAtPath (clear live buffers)");
-                }
-            }
-            Class gpuCls = NSClassFromString(@"Rk3");
-            if (!gpuCls) gpuCls = NSClassFromString(@"GPUImageProcessor");
-            if (gpuCls) {
-                Method mt = class_getInstanceMethod(gpuCls, NSSelectorFromString(@"transferPixelBuffer:toPixelBuffer:token:"));
-                if (mt) {
-                    gOrig_transfer = (BOOL (*)(id,SEL,CVPixelBufferRef,CVPixelBufferRef,uint64_t))method_getImplementation(mt);
-                    method_setImplementation(mt, (IMP)VcamFix_transfer);
-                    VcamFix_Log(@"swizzled transferPixelBuffer (green-edge fix)");
                 }
             }
 
@@ -495,17 +366,9 @@ static void VcamFixInit(void) {
             });
             dispatch_resume(gTimerMD);
 
-            gTimerTok = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-            dispatch_source_set_timer(gTimerTok,
-                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
-                (uint64_t)(0.05 * NSEC_PER_SEC), (uint64_t)(0.01 * NSEC_PER_SEC));
-            dispatch_source_set_event_handler(gTimerTok, ^{
-                @autoreleasepool { VcamFix_ActionTick(); }
-            });
-            dispatch_resume(gTimerTok);
-
         } else if (isSB) {
             VcamFix_Log([NSString stringWithFormat:@"sb init pid=%d", getpid()]);
+
             Class hideCls = NSClassFromString(@"VCamHidePatch");
             if (hideCls) {
                 Method m1 = class_getClassMethod(hideCls, NSSelectorFromString(@"hideBall"));
@@ -515,6 +378,7 @@ static void VcamFixInit(void) {
                 Method m3 = class_getClassMethod(hideCls, NSSelectorFromString(@"pollForPanelAndInjectButton"));
                 if (m3) method_setImplementation(m3, (IMP)VcamFix_pollHide);
             }
+
             dispatch_queue_t q = dispatch_get_main_queue();
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                            q, ^{ VcamFix_EnsureControlTabTarget(); });
