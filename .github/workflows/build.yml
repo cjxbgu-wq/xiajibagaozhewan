@@ -46,8 +46,8 @@ jobs:
         run: |
           set -e
           python3 apply_all.py
-          echo "---- 校验关键点 ----"
-          grep -n "vcamApplySourceColorProps" GPUImageProcessor.m || true
+          echo "---- 关键点校验 ----"
+          grep -n "vcamPhotoForceSDR" Tweak.m || true
           grep -n "media file changed" VcamFix.m || true
           grep -n "replayPath = " VCamCore.m || true
 
