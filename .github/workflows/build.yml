@@ -54,14 +54,15 @@ jobs:
           echo "---- VCamCore.m 第 960-964 行 ----"
           sed -n '960,964p' VCamCore.m
 
-      - name: Apply fix2 (VcamFix/GPUImageProcessor, idempotent)
+      - name: Apply fix2 (色彩 + 换视频残留)
         run: |
           set -e
           python3 apply_fix2.py
-          echo "---- 校验：VcamFix.m ----"
-          grep -n "media file changed" VcamFix.m || true
-          echo "---- 校验：GPUImageProcessor.m ----"
-          grep -n "vcamSyncColorAttachments(src, dst)" GPUImageProcessor.m || true
+
+      - name: Apply fix3 (发热 + 卡顿)
+        run: |
+          set -e
+          python3 apply_fix3.py
 
       - name: Build
         run: |
