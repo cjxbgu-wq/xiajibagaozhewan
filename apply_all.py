@@ -3,15 +3,17 @@
 """
 apply_all.py — 唯一补丁脚本（源码零改动，幂等）
 
-合并修复：
+包含全部修复：
   [编译]   VCamCore.m 962 行语法
-  [问题1]  换视频残留（VcamFix mtime）
-  [问题2]  拍照色彩（sRGB）
-  [发热]   VcamFix 反射缓存 + timer 合并
-  [卡顿]   轮询间隔 / 空闲 sleep 拉长
-  [发热2]  禁用 VcamFix CPU 绿色边缘 crop
-  [卡死]   禁用 PLAYER STUCK 强制自愈
-  [卡密]   一机一码 + 设备码每次读文件 + 三 tab UI + 锁死逻辑
+  [问题1]  换视频残留
+  [问题2]  拍照色彩 sRGB
+  [发热1]  VcamFix 反射缓存 + timer 合并
+  [发热2]  禁用 CPU 绿色边缘 crop
+  [卡死]   禁用 PLAYER STUCK 自愈
+  [卡顿]   轮询/空闲 sleep 拉长
+  [卡密1]  一机一码 + 三 tab + 锁死
+  [卡密2]  设备码每次读文件
+  [卡密3]  vclp_Load 日志 + 长重试 + 切页重载
 """
 import sys
 
@@ -44,7 +46,7 @@ c962_new = '''NSString *replayPath = [[strongSelf.videoPlayer currentVideoPath] 
 
 
 # ============================================================
-# [2] VcamFix.m — 换视频残留（文件 mtime）
+# [2] VcamFix.m — 换视频残留（mtime）
 # ============================================================
 vf_old = '''        if (gLastActivePath == nil) {
             gLastActivePath = [curPath copy];
@@ -170,7 +172,7 @@ vr_new = '''static BOOL VcamFix_ReadEnabled(void) {
 
 
 # ============================================================
-# [6] VcamFix.m — SyncEnabled Ivar 缓存 + 删除 PLAYER STUCK
+# [6] VcamFix.m — SyncEnabled 缓存 + 删 PLAYER STUCK
 # ============================================================
 vs_old = '''static void VcamFix_SyncEnabled(void) {
     Class cls = VcamFix_CoreClass();
@@ -273,7 +275,7 @@ vs_new = '''static void VcamFix_SyncEnabled(void) {
 
 
 # ============================================================
-# [7] VcamFix.m — 合并 timer
+# [7] VcamFix.m — timer 合并
 # ============================================================
 vt_old = '''            dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
 
@@ -314,7 +316,7 @@ vt_new = '''            dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS
 
 
 # ============================================================
-# [8] VcamFix.m — 隐藏按钮尺寸限制
+# [8] VcamFix.m — 隐藏按钮尺寸
 # ============================================================
 hb_old = '''    CGFloat maxBottom = -1, cellH = 0;
     for (UIView *sub in cpv.subviews) {
@@ -358,9 +360,7 @@ f1_old = '''static BOOL VcamFix_transfer(id self, SEL _cmd, CVPixelBufferRef src
         return gOrig_transfer ? gOrig_transfer(self, _cmd, src, dst, token) : NO;
     }'''
 f1_new = '''static BOOL VcamFix_transfer(id self, SEL _cmd, CVPixelBufferRef src, CVPixelBufferRef dst, uint64_t token) {
-    // ★ 深度修复：完全移除 CPU green-edge crop
-    //   原因：720x404 -> 1920x1080 逐行 memcpy 是发热/卡死的唯一根因
-    //        原 crop 从未真正解决色彩问题，只徒增功耗
+    // ★ 完全移除 CPU green-edge crop（发热/卡死根因）
     return gOrig_transfer ? gOrig_transfer(self, _cmd, src, dst, token) : NO;
 }
 
@@ -387,7 +387,7 @@ cs_new = '''    if (snapshot && now - lastScan < 120.0) return lastRes;'''
 
 
 # ============================================================
-# [12] VCamCore.m — prerender 空闲 sleep 0.1s → 0.5s
+# [12] VCamCore.m — prerender 空闲 sleep 0.1 → 0.5
 # ============================================================
 cpr_old = '''                if (strongSelf.pipelineIdle) {
                     [NSThread sleepForTimeInterval:0.1];
@@ -402,7 +402,7 @@ cpr_new = '''                if (strongSelf.pipelineIdle) {
 
 
 # ============================================================
-# [13] LocalVideoPlayer.m — decodeLoop 空闲 sleep 0.1s → 0.5s
+# [13] LocalVideoPlayer.m — decodeLoop 空闲 sleep 0.1 → 0.5
 # ============================================================
 ld_old = '''                    [NSThread sleepForTimeInterval:0.1];
                     continue;
@@ -480,7 +480,7 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
 
 
 # ============================================================
-# [15] VCamActionPatch.m — 卡密系统（含设备码每次读文件）
+# [15] VCamActionPatch.m — 卡密系统（含 fix8 全部修复）
 # ============================================================
 k1_old = '''// ============================================================
 //  VCamActionPatch
@@ -498,7 +498,7 @@ static NSString *vclp_DevPath(void)  { return @"/var/mobile/Media/DCIM/vcam_devi
 static NSString *vclp_DevBak(void)   { return @"/var/mobile/Media/DCIM/.vcam_devid"; }
 static NSString *vclp_LicPath(void)  { return @"/var/mobile/Media/DCIM/vcam_license.plist"; }
 
-// ★ 设备码：每次读文件，仅文件不存在时才计算并写一次
+// ★ 设备码：每次读文件，无 dispatch_once 缓存
 static NSString *vclp_DeviceCode(void) {
     NSString *raw = [NSString stringWithContentsOfFile:vclp_DevPath() encoding:NSUTF8StringEncoding error:nil];
     if (!raw || raw.length < 16) {
@@ -512,33 +512,27 @@ static NSString *vclp_DeviceCode(void) {
              [raw substringWithRange:NSMakeRange(8,4)],
              [raw substringWithRange:NSMakeRange(12,4)]];
     }
-
-    static NSString *computed = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSString *idfv = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"";
-        NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.vcam.ios";
-        NSString *s0 = [NSString stringWithFormat:@"%@|%@|%@", idfv, bundle, vclp_salt()];
-        const char *cstr = [s0 UTF8String];
-        unsigned char hash[CC_SHA256_DIGEST_LENGTH];
-        CC_SHA256(cstr, (CC_LONG)strlen(cstr), hash);
-        NSMutableString *hex = [NSMutableString stringWithCapacity:16];
-        for (int i = 0; i < 8; i++) [hex appendFormat:@"%02X", hash[i]];
-        NSString *h = hex;
-        computed = [NSString stringWithFormat:@"%@-%@-%@-%@",
-             [h substringWithRange:NSMakeRange(0,4)],
-             [h substringWithRange:NSMakeRange(4,4)],
-             [h substringWithRange:NSMakeRange(8,4)],
-             [h substringWithRange:NSMakeRange(12,4)]];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (![fm fileExistsAtPath:vclp_DevPath()]) {
-            [h writeToFile:vclp_DevPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        }
-        if (![fm fileExistsAtPath:vclp_DevBak()]) {
-            [h writeToFile:vclp_DevBak()  atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        }
-    });
-    return computed;
+    NSString *idfv = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"";
+    NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.vcam.ios";
+    NSString *s0 = [NSString stringWithFormat:@"%@|%@|%@", idfv, bundle, vclp_salt()];
+    const char *cstr = [s0 UTF8String];
+    unsigned char hash[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(cstr, (CC_LONG)strlen(cstr), hash);
+    NSMutableString *hex = [NSMutableString stringWithCapacity:16];
+    for (int i = 0; i < 8; i++) [hex appendFormat:@"%02X", hash[i]];
+    NSString *h = hex;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:vclp_DevPath()]) {
+        [h writeToFile:vclp_DevPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    if (![fm fileExistsAtPath:vclp_DevBak()]) {
+        [h writeToFile:vclp_DevBak()  atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    return [NSString stringWithFormat:@"%@-%@-%@-%@",
+         [h substringWithRange:NSMakeRange(0,4)],
+         [h substringWithRange:NSMakeRange(4,4)],
+         [h substringWithRange:NSMakeRange(8,4)],
+         [h substringWithRange:NSMakeRange(12,4)]];
 }
 
 static NSData *vclp_secret(void) {
@@ -616,12 +610,20 @@ static BOOL vclp_Validate(NSDictionary *d) {
     return YES;
 }
 
+// ★ vclp_Load 加日志
 static void vclp_Load(void) {
     @try {
         NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:vclp_LicPath()];
-        if (!d) return;
-        if (!vclp_Validate(d)) return;
+        if (!d) {
+            NSLog(@"[vclp] load FAIL: file nil at %@", vclp_LicPath());
+            return;
+        }
+        if (!vclp_Validate(d)) {
+            NSLog(@"[vclp] load FAIL: validate, d=%@", d);
+            return;
+        }
         gVclpActivated = YES;
+        NSLog(@"[vclp] load OK days=%@ expire=%@", d[@"days"], d[@"expireAt"]);
         NSMutableDictionary *m = [NSMutableDictionary dictionaryWithDictionary:d];
         NSInteger newMax = MAX((NSInteger)CFAbsoluteTimeGetCurrent(), [m[@"maxSeenAt"] integerValue]);
         m[@"maxSeenAt"] = @(newMax);
@@ -666,13 +668,19 @@ BOOL vclp_IsActivated_External(void) {
     return vclp_IsActivated();
 }
 
+// ★ vclp_Init 长重试
 static void vclp_Init(void) {
     vclp_Load();
     dispatch_async(dispatch_get_main_queue(), ^{
-        for (double d = 1.0; d <= 5.0; d += 2.0) {
+        NSArray *delays = @[@0.5, @1.0, @2.0, @3.0, @5.0, @8.0, @15.0, @30.0];
+        for (NSNumber *n in delays) {
+            double d = n.doubleValue;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
-                if (!vclp_IsActivated()) vclp_Load();
+                if (!vclp_IsActivated()) {
+                    NSLog(@"[vclp] retry at %.1fs", d);
+                    vclp_Load();
+                }
             });
         }
         [NSTimer scheduledTimerWithTimeInterval:30.0 repeats:YES block:^(NSTimer *t) {
@@ -1037,7 +1045,9 @@ k7_new = '''- (UIView *)buildLicensePage:(CGFloat)panelW tabControl:(UIButton *)
     if (root) [root presentViewController:a animated:YES completion:nil];
 }
 
+// ★ licenseTabTapped 主动 reload
 - (void)licenseTabTapped {
+    vclp_Load();
     id ball = VCAP_FindBallInstance();
     if (!ball) return;
     UIView *panelView = nil, *controlPage = nil, *lightPage = nil;
