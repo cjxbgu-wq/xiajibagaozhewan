@@ -62,7 +62,7 @@ vcamfix_new = '''        if (gLastActivePath == nil) {
             return;
         }
 
-        // \u2605 文件内容变化检测（路径不变、文件被覆盖的场景）
+        // \\u2605 文件内容变化检测（路径不变、文件被覆盖的场景）
         static double sLastMtime = 0;
         static unsigned long long sLastSize = 0;
         static NSString *sWatchedPath = nil;
