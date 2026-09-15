@@ -1,6 +1,6 @@
 //
 //  GPUImageProcessor.m
-//  图像处理器（旋转/镜像/格式转换/用户变换）
+//  图像处理器（旋转/镜像/格式转换/用户变换 + 绿边修复）
 //
 
 #import "GPUImageProcessor.h"
@@ -9,19 +9,14 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <dlfcn.h>
 
-// ===== VideoToolbox 类型手动声明 =====
 typedef struct OpaqueVTPixelTransferSession *VTPixelTransferSessionRef;
 typedef struct OpaqueVTPixelRotationSession *VTPixelRotationSessionRef;
 OSStatus VTPixelTransferSessionCreate(CFAllocatorRef, VTPixelTransferSessionRef *);
 OSStatus VTPixelTransferSessionTransferImage(VTPixelTransferSessionRef, CVPixelBufferRef, CVPixelBufferRef);
 OSStatus VTSessionSetProperty(CFTypeRef session, CFStringRef propertyKey, CFTypeRef propertyValue);
-
 typedef OSStatus (*VTPixelRotationSessionCreateFunc)(CFAllocatorRef, VTPixelRotationSessionRef *);
 typedef OSStatus (*VTPixelRotationSessionTransferImageFunc)(VTPixelRotationSessionRef, CVPixelBufferRef, CVPixelBufferRef);
 
-// ============================================================
-//  日志
-// ============================================================
 extern BOOL vcam_log_budget_take(void);
 
 static BOOL vcam_log_enabled(void) {
@@ -77,6 +72,7 @@ typedef struct {
 #define kVcamLaneStagingMax 4
 static VCamLaneStagingSlot gVcamLaneStaging[kVcamLaneStagingMax];
 
+// ★ 绿边修复: 整数预裁剪槽 (per-ratio, BGRA)
 typedef struct {
     size_t w, h;
     CVPixelBufferRef staging;
@@ -228,6 +224,7 @@ void vcamLaneResetAllMemos(void) {
 static void vcamMirrorRowsInPlace(CVPixelBufferRef pb);
 static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst);
 static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst);
+static void vcamTrimFractionalCrop(CVPixelBufferRef src, CVPixelBufferRef dst, BOOL *fixH, BOOL *fixV);
 static VCamLaneStagingSlot *vcamPrivateStagingFor(size_t srcW, size_t srcH);
 static BOOL vcamPrivateLaneTransfer(GPUImageProcessor *self,
                                     CVPixelBufferRef src, CVPixelBufferRef dst,
@@ -337,6 +334,12 @@ static BOOL vcamPrivateLaneTransfer(GPUImageProcessor *self,
 - (void)setPrerenderRotateBuffer:(CVPixelBufferRef)buf atSlot:(int)slot;
 - (CVPixelBufferRef)userCanvasAtSlot:(int)slot;
 - (void)setUserCanvas:(CVPixelBufferRef)buf atSlot:(int)slot;
+
+// ★ 绿边修复
+- (VTPixelTransferSessionRef)normalTransferSession;
+- (CVPixelBufferRef)cropStagingForRatio:(CVPixelBufferRef)staging
+                                    dst:(CVPixelBufferRef)dst
+                               srcToken:(uint64_t)srcToken;
 @end
 
 // ============================================================
@@ -424,7 +427,7 @@ static BOOL vcamPrivateLaneTransfer(GPUImageProcessor *self,
         [self setupYUVTransferSession];
         [self setupPrerenderTransferSession];
         [self setupPixelRotationSession];
-        vcam_gpu_log(@"[vcam] GPUImageProcessor initialized");
+        vcam_gpu_log(@"[vcam] GPUImageProcessor initialized (with green-edge fix)");
     }
     return self;
 }
@@ -445,6 +448,16 @@ static BOOL vcamPrivateLaneTransfer(GPUImageProcessor *self,
             CVPixelBufferRelease(gVcamLaneStaging[i].staging);
             gVcamLaneStaging[i].staging = NULL;
         }
+    }
+    for (int i = 0; i < kVcamCropStagingMax; i++) {
+        if (gVcamCropStaging[i].staging) {
+            CVPixelBufferRelease(gVcamCropStaging[i].staging);
+            gVcamCropStaging[i].staging = NULL;
+        }
+    }
+    if (gVcamNormalSession && invalidate) {
+        invalidate(gVcamNormalSession);
+        gVcamNormalSession = NULL;
     }
 
     for (int i = 0; i < 3; i++) {
@@ -498,7 +511,6 @@ static BOOL vcamPrivateLaneTransfer(GPUImageProcessor *self,
     if (status == noErr && s) {
         VTSessionSetProperty(s, CFSTR("ScalingMode"), CFSTR("Trim"));
         _bgraTransferSession = s;
-        vcam_gpu_log(@"[vcam] BGRA VTPixelTransferSession created");
     }
 }
 
@@ -509,7 +521,6 @@ static BOOL vcamPrivateLaneTransfer(GPUImageProcessor *self,
     if (status == noErr && s) {
         VTSessionSetProperty(s, CFSTR("ScalingMode"), CFSTR("Trim"));
         _yuvTransferSession = s;
-        vcam_gpu_log(@"[vcam] YUV VTPixelTransferSession created");
     }
 }
 
@@ -520,7 +531,6 @@ static BOOL vcamPrivateLaneTransfer(GPUImageProcessor *self,
     if (status == noErr && s) {
         VTSessionSetProperty(s, CFSTR("ScalingMode"), CFSTR("Trim"));
         _prerenderTransferSession = s;
-        vcam_gpu_log(@"[vcam] Prerender VTPixelTransferSession created");
     }
 }
 
@@ -547,7 +557,6 @@ static BOOL vcamPrivateLaneTransfer(GPUImageProcessor *self,
 
     if (!_createRotationSession || !_transferRotationImage) {
         _rotationApiAvailable = NO;
-        vcam_gpu_log(@"[vcam] VTPixelRotationSession API unavailable");
         return;
     }
 
@@ -559,39 +568,35 @@ static BOOL vcamPrivateLaneTransfer(GPUImageProcessor *self,
         VTPixelRotationSessionRef rs = NULL;
         OSStatus st2 = _createRotationSession(kCFAllocatorDefault, &rs);
         if (st2 == noErr && rs) _renderRotationSession = rs;
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] rotation session created (render=%d)", (int)st2]);
     } else {
         _rotationApiAvailable = NO;
     }
 }
 
-#pragma mark - 3 槽存取 helper
+#pragma mark - 3 槽存取
 
 - (CVPixelBufferRef)prerenderRotateBufferAtSlot:(int)slot {
     if (slot == 0) return _prerenderRotatePool0;
     if (slot == 1) return _prerenderRotatePool1;
     return _prerenderRotatePool2;
 }
-
 - (void)setPrerenderRotateBuffer:(CVPixelBufferRef)buf atSlot:(int)slot {
     if (slot == 0) _prerenderRotatePool0 = buf;
     else if (slot == 1) _prerenderRotatePool1 = buf;
     else _prerenderRotatePool2 = buf;
 }
-
 - (CVPixelBufferRef)userCanvasAtSlot:(int)slot {
     if (slot == 0) return _userCanvasPool0;
     if (slot == 1) return _userCanvasPool1;
     return _userCanvasPool2;
 }
-
 - (void)setUserCanvas:(CVPixelBufferRef)buf atSlot:(int)slot {
     if (slot == 0) _userCanvasPool0 = buf;
     else if (slot == 1) _userCanvasPool1 = buf;
     else _userCanvasPool2 = buf;
 }
 
-#pragma mark - CPU 镜像（原地行反转）
+#pragma mark - 静态辅助函数
 
 static void vcamMirrorRowsInPlace(CVPixelBufferRef pb) {
     if (!pb) return;
@@ -677,7 +682,27 @@ static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst)
     }
 }
 
-#pragma mark - 旋转 + 镜像（预渲染路径）
+// ★ 绿边修复: Trim crop offset 非整数判定
+static void vcamTrimFractionalCrop(CVPixelBufferRef src, CVPixelBufferRef dst, BOOL *fixH, BOOL *fixV) {
+    *fixH = NO; *fixV = NO;
+    if (!src || !dst) return;
+    size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
+    size_t dstW = CVPixelBufferGetWidth(dst), dstH = CVPixelBufferGetHeight(dst);
+    if (!srcW || !srcH || !dstW || !dstH) return;
+    double sc = MAX((double)dstW / srcW, (double)dstH / srcH);
+    double cropW = srcW * sc - dstW;
+    double cropH = srcH * sc - dstH;
+    if (cropW > 0.5) {
+        double off = cropW / 2.0;
+        *fixH = (fabs(off - floor(off + 0.5)) > 1e-3);
+    }
+    if (cropH > 0.5) {
+        double off = cropH / 2.0;
+        *fixV = (fabs(off - floor(off + 0.5)) > 1e-3);
+    }
+}
+
+#pragma mark - 旋转 + 镜像
 
 - (CVPixelBufferRef)rotateAndMirrorIfNeeded:(CVPixelBufferRef)input CF_RETURNS_RETAINED {
     if (!input) return NULL;
@@ -758,7 +783,7 @@ static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst)
     return work;
 }
 
-#pragma mark - 自适应正交旋转（render 路径）
+#pragma mark - 自适应正交旋转
 
 - (CVPixelBufferRef)adaptiveRotateIfNeeded:(CVPixelBufferRef)src
                                targetWidth:(size_t)targetW
@@ -893,7 +918,94 @@ static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst)
     [self getOrCreatePoolForWidth:width height:height format:format];
 }
 
-#pragma mark - 格式转换 · 私有车道
+#pragma mark - ★ 绿边修复 (新增)
+
+- (VTPixelTransferSessionRef)normalTransferSession {
+    if (!gVcamNormalSession) {
+        if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &gVcamNormalSession) == noErr) {
+            VTSessionSetProperty(gVcamNormalSession, CFSTR("ScalingMode"), CFSTR("Normal"));
+            VTSessionSetProperty(gVcamNormalSession, CFSTR("RealTime"), kCFBooleanTrue);
+            vcam_gpu_log(@"[vcam] Normal transfer session created (green-edge fix)");
+        }
+    }
+    return gVcamNormalSession;
+}
+
+- (CVPixelBufferRef)cropStagingForRatio:(CVPixelBufferRef)staging
+                                    dst:(CVPixelBufferRef)dst
+                               srcToken:(uint64_t)srcToken {
+    if (!staging || !dst) return NULL;
+    size_t sw = CVPixelBufferGetWidth(staging), sh = CVPixelBufferGetHeight(staging);
+    size_t dw = CVPixelBufferGetWidth(dst), dh = CVPixelBufferGetHeight(dst);
+    if (!sw || !sh || !dw || !dh) return NULL;
+
+    double r = (double)dw / dh;
+    size_t cw, ch;
+    if ((double)sw / sh > r) { ch = sh; cw = (size_t)(sh * r); }
+    else                     { cw = sw; ch = (size_t)(sw / r); }
+    cw &= ~(size_t)1; ch &= ~(size_t)1;
+    if (cw < 4 || ch < 4 || cw > sw || ch > sh) return NULL;
+    size_t cx = (((sw - cw) / 2) & ~(size_t)1);
+    size_t cy = (((sh - ch) / 2) & ~(size_t)1);
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    VCamCropStagingSlot *slot = NULL;
+    int lruIdx = 0;
+    for (int i = 0; i < kVcamCropStagingMax; i++) {
+        if (gVcamCropStaging[i].staging &&
+            gVcamCropStaging[i].w == cw && gVcamCropStaging[i].h == ch) {
+            slot = &gVcamCropStaging[i]; break;
+        }
+        if (gVcamCropStaging[i].lastUse < gVcamCropStaging[lruIdx].lastUse) lruIdx = i;
+    }
+    if (!slot) {
+        int idx = -1;
+        for (int i = 0; i < kVcamCropStagingMax; i++) {
+            if (!gVcamCropStaging[i].staging) { idx = i; break; }
+        }
+        if (idx < 0) {
+            idx = lruIdx;
+            CVPixelBufferRelease(gVcamCropStaging[idx].staging);
+            gVcamCropStaging[idx].staging = NULL;
+        }
+        CVPixelBufferRef nb = NULL;
+        if (CVPixelBufferCreate(kCFAllocatorDefault, cw, ch,
+                                kCVPixelFormatType_32BGRA, NULL, &nb) != noErr || !nb) return NULL;
+        gVcamCropStaging[idx].w = cw;
+        gVcamCropStaging[idx].h = ch;
+        gVcamCropStaging[idx].staging = nb;
+        gVcamCropStaging[idx].token = 0;
+        gVcamCropStaging[idx].lastUse = now;
+        slot = &gVcamCropStaging[idx];
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Crop staging built %zux%zu (slot %d)", cw, ch, idx]);
+    }
+    slot->lastUse = now;
+    if (slot->token == srcToken && srcToken != 0) return slot->staging;
+
+    BOOL copied = NO;
+    if (CVPixelBufferLockBaseAddress(staging, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess) {
+        if (CVPixelBufferLockBaseAddress(slot->staging, 0) == kCVReturnSuccess) {
+            uint8_t *sb = (uint8_t *)CVPixelBufferGetBaseAddress(staging);
+            uint8_t *db = (uint8_t *)CVPixelBufferGetBaseAddress(slot->staging);
+            size_t srb = CVPixelBufferGetBytesPerRow(staging);
+            size_t drb = CVPixelBufferGetBytesPerRow(slot->staging);
+            if (sb && db && srb >= cw * 4 && drb >= cw * 4) {
+                size_t rowBytes = cw * 4;
+                for (size_t y = 0; y < ch; y++) {
+                    memcpy(db + y * drb, sb + (cy + y) * srb + cx * 4, rowBytes);
+                }
+                slot->token = srcToken;
+                copied = YES;
+            }
+            vcamSyncColorAttachments(staging, slot->staging);
+            CVPixelBufferUnlockBaseAddress(slot->staging, 0);
+        }
+        CVPixelBufferUnlockBaseAddress(staging, kCVPixelBufferLock_ReadOnly);
+    }
+    return copied ? slot->staging : NULL;
+}
+
+#pragma mark - 私有车道
 
 static VCamLaneStagingSlot *vcamPrivateStagingFor(size_t srcW, size_t srcH) {
     VCamLaneStagingSlot *slot = NULL;
@@ -923,6 +1035,7 @@ static VCamLaneStagingSlot *vcamPrivateStagingFor(size_t srcW, size_t srcH) {
     return slot;
 }
 
+// ★ 私有格式车道: s1 staging (BGRA) → s2 加绿边修复 + Normal 缩放
 static BOOL vcamPrivateLaneTransfer(GPUImageProcessor *self,
                                     CVPixelBufferRef src, CVPixelBufferRef dst,
                                     uint64_t token) {
@@ -967,9 +1080,37 @@ static BOOL vcamPrivateLaneTransfer(GPUImageProcessor *self,
     }
     if (!ok) return NO;
 
-    OSStatus st2 = VTPixelTransferSessionTransferImage(s2, slot->staging, dst);
+    // ★ 绿边修复: BGRA staging → 私有目标, 检查 Trim crop 是否非整数
+    CVPixelBufferRef s2src = slot->staging;
+    VTPixelTransferSessionRef s2sess = s2;
+    BOOL fixH = NO, fixV = NO;
+    vcamTrimFractionalCrop(slot->staging, dst, &fixH, &fixV);
+    if (fixH || fixV) {
+        CVPixelBufferRef cropped = [self cropStagingForRatio:slot->staging
+                                                         dst:dst
+                                                    srcToken:slot->token];
+        if (cropped) {
+            VTPixelTransferSessionRef ns = [self normalTransferSession];
+            if (ns) {
+                s2src = cropped;
+                s2sess = ns;
+                static CFAbsoluteTime lastLog = 0;
+                CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+                if (now - lastLog > 5.0) {
+                    lastLog = now;
+                    vcam_gpu_log([NSString stringWithFormat:
+                        @"[vcam] green-edge fix (private lane) %zux%zu -> %zux%zu",
+                        srcW, srcH, CVPixelBufferGetWidth(dst), CVPixelBufferGetHeight(dst)]);
+                }
+            }
+        }
+    }
+
+    OSStatus st2 = VTPixelTransferSessionTransferImage(s2sess, s2src, dst);
     return (st2 == noErr);
 }
+
+#pragma mark - transferPixelBuffer (绿边修复调用)
 
 - (BOOL)transferPixelBuffer:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst {
     return [self transferPixelBuffer:src toPixelBuffer:dst token:0];
@@ -1030,8 +1171,40 @@ static BOOL vcamPrivateLaneTransfer(GPUImageProcessor *self,
     if (!session || !laneLock) return NO;
 
     [laneLock lock];
+
+    // ★ 绿边修复 (标准 YUV 车道): BGRA 源 → YUV420 dst 且 Trim crop offset 非整数
+    // → 用整数预裁剪 + Normal 缩放
+    CVPixelBufferRef xferSrc = src;
+    VTPixelTransferSessionRef xferSess = session;
+    if (isYuvLane && !isBgraLane &&
+        CVPixelBufferGetPixelFormatType(src) == kCVPixelFormatType_32BGRA) {
+        BOOL fixH = NO, fixV = NO;
+        vcamTrimFractionalCrop(src, dst, &fixH, &fixV);
+        if (fixH || fixV) {
+            [_laneLockPrivate lock];
+            CVPixelBufferRef cropped = [self cropStagingForRatio:src dst:dst srcToken:token];
+            if (cropped) {
+                VTPixelTransferSessionRef ns = [self normalTransferSession];
+                if (ns) {
+                    xferSrc = cropped;
+                    xferSess = ns;
+                    static CFAbsoluteTime lastLog = 0;
+                    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+                    if (now - lastLog > 5.0) {
+                        lastLog = now;
+                        vcam_gpu_log([NSString stringWithFormat:
+                            @"[vcam] green-edge fix (YUV lane) %zux%zu -> %zux%zu",
+                            CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src),
+                            CVPixelBufferGetWidth(dst), CVPixelBufferGetHeight(dst)]);
+                    }
+                }
+            }
+            [_laneLockPrivate unlock];
+        }
+    }
+
     CFAbsoluteTime tOp = CFAbsoluteTimeGetCurrent();
-    OSStatus status = VTPixelTransferSessionTransferImage(session, src, dst);
+    OSStatus status = VTPixelTransferSessionTransferImage(xferSess, xferSrc, dst);
     [self noteStageTimingFmt:(uint32_t)dstFormat
                             w:(uint32_t)CVPixelBufferGetWidth(dst)
                             h:(uint32_t)CVPixelBufferGetHeight(dst)
@@ -1099,11 +1272,9 @@ static BOOL vcamPrivateLaneTransfer(GPUImageProcessor *self,
     if (fabs(z - 1.0) < 0.001 && _userPanX == 0.0 && _userPanY == 0.0) {
         return (CVPixelBufferRef)CVPixelBufferRetain(input);
     }
-
     if (CVPixelBufferGetPlaneCount(input) != 2) {
         return (CVPixelBufferRef)CVPixelBufferRetain(input);
     }
-
     size_t W = CVPixelBufferGetWidth(input);
     size_t H = CVPixelBufferGetHeight(input);
     if (W < 16 || H < 16) return (CVPixelBufferRef)CVPixelBufferRetain(input);
@@ -1124,7 +1295,6 @@ static BOOL vcamPrivateLaneTransfer(GPUImageProcessor *self,
         [self setUserCanvas:canvas atSlot:slot];
     }
 
-    // 色彩附件复制（用 iOS 4+ 的 CVBufferGetAttachments 避免 iOS 15 依赖）
     CFDictionaryRef colorAtts = CVBufferGetAttachments(input, kCVAttachmentMode_ShouldPropagate);
     if (colorAtts) {
         CVBufferSetAttachments(canvas, colorAtts, kCVAttachmentMode_ShouldPropagate);
