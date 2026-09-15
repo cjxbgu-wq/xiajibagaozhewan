@@ -2,9 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 apply_all.py — 唯一补丁脚本（源码零改动，幂等）
-卡密：Keychain（主）+ 文件（备），重启 100% 不掉激活
+本次聚焦：
+  1. 拍照色彩（sRGB + 范围扩展）
+  2. 重启掉激活（设备码持久化 + 4 路径存储）
 """
-import sys, os
+import sys
 
 def patch_file(path, old, new, tag):
     try:
@@ -26,7 +28,7 @@ def patch_file(path, old, new, tag):
     return True
 
 # ============================================================
-# 原有修复
+# 原有修复（保留，不再改动）
 # ============================================================
 c962_old = '''NSString *replayPath = [strongSelf.videoPlayer currentVideoPath copy];'''
 c962_new = '''NSString *replayPath = [[strongSelf.videoPlayer currentVideoPath] copy];'''
@@ -294,22 +296,68 @@ ld_new = '''                    [NSThread sleepForTimeInterval:0.5];
 
                 // 加载代数变化 → 解码线程自行重建 reader'''
 
+# ============================================================
+# ★ 问题 1：拍照色彩 —— sRGB + 范围扩展
+# ============================================================
 ph_helper_old = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);'''
 ph_helper_new = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);
 
-static void vcamPhotoForceSDR709(CMSampleBufferRef sb) {
+// ★ 拍照色彩修复：JPEG 用 sRGB（不是 BT.709）
+static void vcamPhotoForceSRGB(CMSampleBufferRef sb, CVPixelBufferRef srcVideo) {
     if (!sb) return;
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
     if (!pb) return;
+
+    // YCbCr 矩阵 + primaries：优先继承源视频
+    CFTypeRef srcMatrix = srcVideo ? CVBufferGetAttachment(srcVideo, kCVImageBufferYCbCrMatrixKey, NULL) : NULL;
+    CFTypeRef srcPrim   = srcVideo ? CVBufferGetAttachment(srcVideo, kCVImageBufferColorPrimariesKey, NULL) : NULL;
     CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
-                          kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                          srcMatrix ?: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
                           kCVAttachmentMode_ShouldPropagate);
     CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
-                          kCVImageBufferColorPrimaries_ITU_R_709_2,
+                          srcPrim ?: kCVImageBufferColorPrimaries_ITU_R_709_2,
                           kCVAttachmentMode_ShouldPropagate);
+    // ★ 关键：JPEG 用 sRGB transfer，不是 BT.709
     CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
-                          kCVImageBufferTransferFunction_ITU_R_709_2,
+                          CFSTR("IEC_sRGB"),
                           kCVAttachmentMode_ShouldPropagate);
+
+    // 范围检查：目标/源 range 不一致时，做 CPU 级 Y/CbCr 扩展
+    OSType dstFmt = CVPixelBufferGetPixelFormatType(pb);
+    BOOL dstIsFull = (dstFmt == '420f' || dstFmt == kCVPixelFormatType_32BGRA);
+    BOOL srcIsFull = YES;
+    if (srcVideo) {
+        OSType srcFmt = CVPixelBufferGetPixelFormatType(srcVideo);
+        srcIsFull = (srcFmt == '420f' || srcFmt == kCVPixelFormatType_32BGRA);
+    }
+    if (dstIsFull == srcIsFull) return;
+    if (CVPixelBufferGetPlaneCount(pb) != 2) return;
+    if (CVPixelBufferLockBaseAddress(pb, 0) != kCVReturnSuccess) return;
+
+    BOOL expand = (dstIsFull && !srcIsFull);
+    for (int p = 0; p < 2; p++) {
+        uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, p);
+        if (!base) continue;
+        size_t w = CVPixelBufferGetWidthOfPlane(pb, p);
+        size_t h = CVPixelBufferGetHeightOfPlane(pb, p);
+        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, p);
+        for (size_t y = 0; y < h; y++) {
+            uint8_t *row = base + y * bpr;
+            for (size_t x = 0; x < w; x++) {
+                int v = row[x];
+                if (p == 0) {
+                    if (expand) { v = (v - 16) * 255 / 219; }
+                    else        { v = v * 219 / 255 + 16; }
+                } else {
+                    if (expand) { v = (v - 128) * 255 / 224 + 128; }
+                    else        { v = (v - 128) * 224 / 255 + 128; }
+                }
+                if (v < 0) v = 0; if (v > 255) v = 255;
+                row[x] = (uint8_t)v;
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, 0);
 }'''
 
 ph_hook_old = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
@@ -336,9 +384,10 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
             CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
             if (pixelBuffer) {
                 @try {
+                    CVPixelBufferRef srcVideo = (CVPixelBufferRef)[[VCamCore sharedInstance] valueForKey:@"liveYUVPixelBuffer"];
                     [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
                                                                          pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
-                    vcamPhotoForceSDR709(sampleBuffer);
+                    vcamPhotoForceSRGB(sampleBuffer, srcVideo);
                 } @catch (NSException *e) {
                     vcam_tweak_log([NSString stringWithFormat:@"[vcam] PhotoEncoder hook exception: %@", e]);
                 }
@@ -351,7 +400,7 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
 }'''
 
 # ============================================================
-# 卡密系统（Keychain 主 + 文件备）
+# ★ 问题 2：重启掉激活 —— 设备码持久化 + 4 路径存储
 # ============================================================
 k1_old = '''// ============================================================
 //  VCamActionPatch
@@ -359,18 +408,38 @@ k1_old = '''// ============================================================
 @interface VCamActionPatch : NSObject'''
 
 k1_new = '''// ============================================================
-//  卡密系统（Keychain 主 + 文件备，重启 100% 不掉）
+//  卡密系统（设备码持久化 + Keychain + 4 路径存储）
 // ============================================================
 #import <CommonCrypto/CommonCrypto.h>
 #import <Security/Security.h>
 #include <sys/stat.h>
 
 static NSString *vclp_salt(void) { return @"vcam_2026_salt_x9k7b3m"; }
+static NSString *vclp_DevPath(void)  { return @"/var/mobile/Library/Preferences/com.vcam.devid"; }
+static NSString *vclp_DevBak(void)   { return @"/var/mobile/Media/DCIM/.vcam_devid"; }
+static NSString *vclp_LicFile(void)  { return @"/var/mobile/Library/Preferences/com.vcam.license.plist"; }
+static NSString *vclp_LicFile2(void) { return @"/var/mobile/Library/Caches/com.vcam.license.plist"; }
+static NSString *vclp_LicFile3(void) { return @"/var/mobile/Media/DCIM/.vcam_lic"; }
 
+// ★ 关键：设备码只算一次，之后从文件读，IDFV 变了也不影响
 static NSString *vclp_DeviceCode(void) {
     static NSString *s = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
+        NSString *saved = [NSString stringWithContentsOfFile:vclp_DevPath() encoding:NSUTF8StringEncoding error:nil];
+        if (!saved || saved.length < 16) {
+            saved = [NSString stringWithContentsOfFile:vclp_DevBak() encoding:NSUTF8StringEncoding error:nil];
+        }
+        saved = [saved stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (saved.length == 16) {
+            s = [NSString stringWithFormat:@"%@-%@-%@-%@",
+                 [saved substringWithRange:NSMakeRange(0,4)],
+                 [saved substringWithRange:NSMakeRange(4,4)],
+                 [saved substringWithRange:NSMakeRange(8,4)],
+                 [saved substringWithRange:NSMakeRange(12,4)]];
+            return;
+        }
+        // 首次：算 + 持久化
         NSString *idfv = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"";
         NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.vcam.ios";
         NSString *raw = [NSString stringWithFormat:@"%@|%@|%@", idfv, bundle, vclp_salt()];
@@ -385,6 +454,8 @@ static NSString *vclp_DeviceCode(void) {
              [h substringWithRange:NSMakeRange(4,4)],
              [h substringWithRange:NSMakeRange(8,4)],
              [h substringWithRange:NSMakeRange(12,4)]];
+        [h writeToFile:vclp_DevPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [h writeToFile:vclp_DevBak()  atomically:YES encoding:NSUTF8StringEncoding error:nil];
     });
     return s;
 }
@@ -406,21 +477,12 @@ static NSData *vclp_secret(void) {
     return s;
 }
 
-// ★ Keychain 主存储：Service = "com.vcam.license"
-static NSString *vclp_KCService(void)  { return @"com.vcam.license"; }
-static NSString *vclp_KCAccount(void)  { return @"activation_v1"; }
-// ★ 文件备份路径（Preferences 沙盒 + DCIM）
-static NSString *vclp_LicPathFile(void) {
-    return @"/var/mobile/Library/Preferences/com.vcam.license.plist";
-}
-static NSString *vclp_LicPathBackup(void) {
-    return @"/var/mobile/Media/DCIM/.vcam_lic";
-}
+static NSString *vclp_KCService(void) { return @"com.vcam.license"; }
+static NSString *vclp_KCAccount(void) { return @"activation_v1"; }
 
 static BOOL gVclpActivated = NO;
 static NSInteger gVclpExpireAt = 0;
 
-// ---------- Keychain 读写 ----------
 static BOOL vclp_KeychainSave(NSString *value) {
     if (!value) return NO;
     NSData *data = [value dataUsingEncoding:NSUTF8StringEncoding];
@@ -437,8 +499,7 @@ static BOOL vclp_KeychainSave(NSString *value) {
         (__bridge id)kSecValueData:      data,
         (__bridge id)kSecAttrAccessible: (__bridge id)kSecAttrAccessibleAfterFirstUnlock,
     };
-    OSStatus st = SecItemAdd((__bridge CFDictionaryRef)add, NULL);
-    return st == errSecSuccess;
+    return SecItemAdd((__bridge CFDictionaryRef)add, NULL) == errSecSuccess;
 }
 
 static NSString *vclp_KeychainLoad(void) {
@@ -456,26 +517,6 @@ static NSString *vclp_KeychainLoad(void) {
     return [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
 }
 
-// ---------- JSON 打包/解包 ----------
-static NSString *vclp_PackJSON(NSString *device, NSString *card, NSInteger days,
-                                NSInteger activatedAt, NSInteger maxSeen) {
-    NSMutableDictionary *d = [NSMutableDictionary dictionary];
-    d[@"deviceCode"]  = device ?: @"";
-    d[@"licenseCode"] = card ?: @"";
-    d[@"days"]        = @(days);
-    d[@"activatedAt"] = @(activatedAt);
-    d[@"maxSeenAt"]   = @(maxSeen);
-    NSData *json = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
-    return [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
-}
-
-static NSDictionary *vclp_UnpackJSON(NSString *s) {
-    if (!s || s.length == 0) return nil;
-    NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
-    return [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
-}
-
-// ---------- 天数 & 签名 ----------
 static NSInteger vclp_DaysFromCard(NSString *card16) {
     if (card16.length != 16) return -1;
     NSString *days4 = [card16 substringFromIndex:12];
@@ -497,8 +538,7 @@ static NSString *vclp_ExpectedSig(NSString *device, NSInteger days) {
     return out;
 }
 
-// ---------- 校验 JSON 内容的合法性 ----------
-static BOOL vclp_ValidateJSON(NSDictionary *d, NSInteger *outDays) {
+static BOOL vclp_Validate(NSDictionary *d) {
     if (!d) return NO;
     NSString *device = d[@"deviceCode"];
     NSString *card = d[@"licenseCode"];
@@ -510,8 +550,7 @@ static BOOL vclp_ValidateJSON(NSDictionary *d, NSInteger *outDays) {
     NSString *sig12 = [clean substringToIndex:12];
     NSInteger days = vclp_DaysFromCard(clean);
     if (days < 0 || days > 1048575) return NO;
-    NSString *expect = vclp_ExpectedSig(device, days);
-    if (![expect isEqualToString:sig12]) return NO;
+    if (![vclp_ExpectedSig(device, days) isEqualToString:sig12]) return NO;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (maxSeen && now < [maxSeen doubleValue] - 300) return NO;
     if (days > 0) {
@@ -522,75 +561,58 @@ static BOOL vclp_ValidateJSON(NSDictionary *d, NSInteger *outDays) {
     } else {
         gVclpExpireAt = 0;
     }
-    if (outDays) *outDays = days;
     return YES;
 }
 
-// ---------- 加载（Keychain 优先，文件兜底） ----------
 static void vclp_Load(void) {
     @try {
-        // 1. Keychain
         NSString *kc = vclp_KeychainLoad();
-        NSDictionary *d = vclp_UnpackJSON(kc);
-        if (!vclp_ValidateJSON(d, NULL)) {
-            // 2. 文件
-            NSDictionary *f = [NSDictionary dictionaryWithContentsOfFile:vclp_LicPathFile()];
-            if (!f) f = [NSDictionary dictionaryWithContentsOfFile:vclp_LicPathBackup()];
-            if (!f) return;
-            NSString *dev = f[@"deviceCode"];
-            NSString *card = f[@"licenseCode"];
-            NSString *merged = vclp_PackJSON(dev, card,
-                vclp_DaysFromCard(card),
-                [f[@"activatedAt"] integerValue],
-                [f[@"maxSeenAt"] integerValue]);
-            d = vclp_UnpackJSON(merged);
-            if (!vclp_ValidateJSON(d, NULL)) return;
-            // 回写 Keychain
-            vclp_KeychainSave(merged);
-        } else {
-            // Keychain 有效，刷新 maxSeenAt
-            NSMutableDictionary *m = [NSMutableDictionary dictionaryWithDictionary:d];
-            NSInteger newMax = MAX((NSInteger)CFAbsoluteTimeGetCurrent(), [m[@"maxSeenAt"] integerValue]);
-            m[@"maxSeenAt"] = @(newMax);
-            NSData *json = [NSJSONSerialization dataWithJSONObject:m options:0 error:nil];
-            NSString *newJson = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
-            vclp_KeychainSave(newJson);
-            [newJson writeToFile:vclp_LicPathFile() atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        }
+        NSDictionary *d = nil;
+        if (kc) d = [NSJSONSerialization JSONObjectWithData:[kc dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+        if (!d) d = [NSDictionary dictionaryWithContentsOfFile:vclp_LicFile()];
+        if (!d) d = [NSDictionary dictionaryWithContentsOfFile:vclp_LicFile2()];
+        if (!d) d = [NSDictionary dictionaryWithContentsOfFile:vclp_LicFile3()];
+        if (!d) return;
+        if (!vclp_Validate(d)) return;
         gVclpActivated = YES;
+        // 刷新 maxSeen 并回写全部路径
+        NSMutableDictionary *m = [NSMutableDictionary dictionaryWithDictionary:d];
+        NSInteger newMax = MAX((NSInteger)CFAbsoluteTimeGetCurrent(), [m[@"maxSeenAt"] integerValue]);
+        m[@"maxSeenAt"] = @(newMax);
+        NSData *json = [NSJSONSerialization dataWithJSONObject:m options:0 error:nil];
+        NSString *jsonStr = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+        vclp_KeychainSave(jsonStr);
+        [m writeToFile:vclp_LicFile()  atomically:YES];
+        [m writeToFile:vclp_LicFile2() atomically:YES];
+        [m writeToFile:vclp_LicFile3() atomically:YES];
     } @catch (...) {}
 }
 
-// ---------- 保存（Keychain + 文件 双写） ----------
 static BOOL vclp_Save(NSString *card) {
     @try {
         NSString *clean = [[card stringByReplacingOccurrencesOfString:@"-" withString:@""] uppercaseString];
         NSInteger days = vclp_DaysFromCard(clean);
         if (days < 0) return NO;
         NSInteger now = (NSInteger)[[NSDate date] timeIntervalSince1970];
-        NSString *json = vclp_PackJSON(vclp_DeviceCode(), clean, days, now, now);
-
-        // 1. Keychain（主）
-        BOOL kcOK = vclp_KeychainSave(json);
-
-        // 2. 文件（备，双路径）
-        NSDictionary *f = @{
-            @"deviceCode":  vclp_DeviceCode(),
-            @"licenseCode": clean,
-            @"activatedAt": @(now),
-            @"maxSeenAt":   @(now),
-            @"expireAt":    @(days > 0 ? now + days * 86400 : 0),
-        };
-        BOOL fOK = [f writeToFile:vclp_LicPathFile() atomically:YES];
-        if (fOK) chmod([vclp_LicPathFile() UTF8String], 0644);
-        if ([f writeToFile:vclp_LicPathBackup() atomically:YES]) {
-            chmod([vclp_LicPathBackup() UTF8String], 0644);
-        }
-        return kcOK || fOK;
+        NSMutableDictionary *m = [NSMutableDictionary dictionary];
+        m[@"deviceCode"]  = vclp_DeviceCode();
+        m[@"licenseCode"] = clean;
+        m[@"activatedAt"] = @(now);
+        m[@"maxSeenAt"]   = @(now);
+        m[@"expireAt"]    = @(days > 0 ? now + days * 86400 : 0);
+        NSData *json = [NSJSONSerialization dataWithJSONObject:m options:0 error:nil];
+        NSString *jsonStr = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+        BOOL kcOK = vclp_KeychainSave(jsonStr);
+        BOOL f1 = [m writeToFile:vclp_LicFile()  atomically:YES];
+        BOOL f2 = [m writeToFile:vclp_LicFile2() atomically:YES];
+        BOOL f3 = [m writeToFile:vclp_LicFile3() atomically:YES];
+        chmod([vclp_LicFile()  UTF8String], 0644);
+        chmod([vclp_LicFile2() UTF8String], 0644);
+        chmod([vclp_LicFile3() UTF8String], 0644);
+        return kcOK || f1 || f2 || f3;
     } @catch (...) { return NO; }
 }
 
-// ---------- 验证用户输入 ----------
 static BOOL vclp_Verify(NSString *userInput) {
     NSString *card = [[userInput stringByReplacingOccurrencesOfString:@"-" withString:@""] uppercaseString];
     card = [card stringByReplacingOccurrencesOfString:@" " withString:@""];
@@ -598,8 +620,7 @@ static BOOL vclp_Verify(NSString *userInput) {
     NSString *sig12 = [card substringToIndex:12];
     NSInteger days = vclp_DaysFromCard(card);
     if (days < 0 || days > 1048575) return NO;
-    NSString *expect = vclp_ExpectedSig(vclp_DeviceCode(), days);
-    return [expect isEqualToString:sig12];
+    return [vclp_ExpectedSig(vclp_DeviceCode(), days) isEqualToString:sig12];
 }
 
 static BOOL vclp_IsActivated(void) { return gVclpActivated; }
@@ -609,9 +630,16 @@ BOOL vclp_IsActivated_External(void) {
     return vclp_IsActivated();
 }
 
+// ★ 启动早期多次重试（文件系统可能未就绪）
 static void vclp_Init(void) {
     vclp_Load();
     dispatch_async(dispatch_get_main_queue(), ^{
+        for (double d = 1.0; d <= 5.0; d += 2.0) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (!vclp_IsActivated()) vclp_Load();
+            });
+        }
         [NSTimer scheduledTimerWithTimeInterval:30.0 repeats:YES block:^(NSTimer *t) {
             vclp_Load();
         }];
@@ -807,14 +835,10 @@ k7_new = '''- (UIView *)buildLicensePage:(CGFloat)panelW tabControl:(UIButton *)
     CGFloat statusH = 20;
     CGFloat tipH = 16;
     CGFloat gap = 10;
-
-    CGFloat pageH = 12 + labelH + 4 + rowH + gap
-                  + labelH + 4 + rowH + gap
-                  + statusH + 4 + tipH + 12;
+    CGFloat pageH = 12 + labelH + 4 + rowH + gap + labelH + 4 + rowH + gap + statusH + 4 + tipH + 12;
 
     UIView *page = [[UIView alloc] initWithFrame:CGRectMake(0, pageTop, panelW, pageH)];
     page.backgroundColor = [UIColor colorWithRed:0.22 green:0.23 blue:0.25 alpha:1.0];
-
     CGFloat y = 12;
 
     UILabel *l1 = [[UILabel alloc] initWithFrame:CGRectMake(pad, y, contentW, labelH)];
@@ -852,7 +876,6 @@ k7_new = '''- (UIView *)buildLicensePage:(CGFloat)panelW tabControl:(UIButton *)
     UIView *activateSection = [[UIView alloc] initWithFrame:CGRectMake(0, y, panelW, labelH + 4 + rowH)];
     activateSection.tag = 0x56435045;
     activateSection.backgroundColor = [UIColor clearColor];
-
     UILabel *l2 = [[UILabel alloc] initWithFrame:CGRectMake(pad, 0, contentW, labelH)];
     l2.text = @"卡密";
     l2.textColor = [UIColor colorWithRed:0.72 green:0.73 blue:0.75 alpha:1.0];
@@ -1141,7 +1164,6 @@ cell_old = "CGFloat cellH = 52;"
 cell_new = "CGFloat cellH = 42;"
 
 def patch_makefile():
-    """给 Makefile 加 Security framework"""
     path = "Makefile"
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -1149,38 +1171,28 @@ def patch_makefile():
     except FileNotFoundError:
         print(f"!! 文件不存在: {path}", file=sys.stderr)
         return False
-
-    if "Security" in content and "VcamMax_FRAMEWORKS" in content:
+    if "Security" in content:
         print(f">> 已应用过，跳过: {path} [frameworks-security]")
         return True
-
     lines = content.split("\n")
     found = False
     out = []
     for ln in lines:
-        if ln.startswith("VcamMax_FRAMEWORKS"):
-            if "Security" not in ln:
-                ln = ln.rstrip() + " Security"
+        if ln.startswith("VcamMax_FRAMEWORKS") and "Security" not in ln:
+            ln = ln.rstrip() + " Security"
             found = True
         out.append(ln)
-    content2 = "\n".join(out)
-
     if not found:
-        # 在 TWEAK_NAME 行后插入
-        lines = content2.split("\n")
-        out = []
+        out2 = []
         inserted = False
-        for ln in lines:
-            out.append(ln)
+        for ln in out:
+            out2.append(ln)
             if ln.startswith("TWEAK_NAME") and not inserted:
-                out.append("VcamMax_FRAMEWORKS = UIKit Security")
+                out2.append("VcamMax_FRAMEWORKS = UIKit Security")
                 inserted = True
-        content2 = "\n".join(out)
-
-    if "Security" not in content2:
-        print(f"!! 未能在 Makefile 中加 Security", file=sys.stderr)
-        return False
-
+        out = out2
+    content2 = "\n".join(out)
+    if "Security" not in content2: return False
     with open(path, "w", encoding="utf-8") as f:
         f.write(content2)
     print(f">> 已修改: {path} [frameworks-security]")
@@ -1199,9 +1211,9 @@ def main():
     ok &= patch_file("VCamCore.m", cs_old, cs_new, "scan-120s")
     ok &= patch_file("VCamCore.m", cpr_old, cpr_new, "prerender-idle-0.5s")
     ok &= patch_file("LocalVideoPlayer.m", ld_old, ld_new, "decode-idle-0.5s")
-    ok &= patch_file("Tweak.m", ph_helper_old, ph_helper_new, "photo-sdr-helper")
-    ok &= patch_file("Tweak.m", ph_hook_old, ph_hook_new, "photo-force-sdr")
-    ok &= patch_file("VCamActionPatch.m", k1_old, k1_new, "license-core-keychain")
+    ok &= patch_file("Tweak.m", ph_helper_old, ph_helper_new, "photo-srgb")
+    ok &= patch_file("Tweak.m", ph_hook_old, ph_hook_new, "photo-force-srgb")
+    ok &= patch_file("VCamActionPatch.m", k1_old, k1_new, "license-persist")
     ok &= patch_file("VCamActionPatch.m", k2_old, k2_new, "license-init")
     ok &= patch_file("VCamActionPatch.m", k3_old, k3_new, "license-interface")
     ok &= patch_file("VCamActionPatch.m", k4_old, k4_new, "license-ivars")
@@ -1225,7 +1237,7 @@ def main():
     if not ok:
         print("!! apply_all 有未匹配项", file=sys.stderr)
         sys.exit(1)
-    print(">> apply_all 完成（Keychain + 文件双保险）")
+    print(">> apply_all 完成（拍照 sRGB + 设备码持久化）")
 
 if __name__ == "__main__":
     main()
