@@ -959,7 +959,7 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         if (restartToken != lastRestartToken) {
             if (lastRestartToken >= 0 && strongSelf.enabled && strongSelf.videoPlayer.currentVideoPath.length > 0) {
                 [strongSelf.videoPlayer resetPlaybackPosition];
-                NSString *replayPath = [strongSelf.videoPlayer currentVideoPath copy];
+                NSString *replayPath = [[strongSelf.videoPlayer currentVideoPath] copy];
                 __weak typeof(strongSelf) wSelf = strongSelf;
                 dispatch_async(strongSelf.processingQueue, ^{
                     VCamCore *sSelf = wSelf;
