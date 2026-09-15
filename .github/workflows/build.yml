@@ -46,13 +46,25 @@ jobs:
         run: |
           set -e
           if grep -qF '[strongSelf.videoPlayer currentVideoPath copy]' VCamCore.m; then
-            echo ">> 检测到原始错误行，应用补丁"
+            echo ">> 检测到原始错误行，应用 fix.patch"
             patch -p1 --forward < fix.patch
           else
-            echo ">> VCamCore.m 已是修正版本，跳过补丁"
+            echo ">> VCamCore.m 已是修正版本，跳过 fix.patch"
           fi
-          echo "---- VCamCore.m 第 962 行现状 ----"
+          echo "---- VCamCore.m 第 960-964 行 ----"
           sed -n '960,964p' VCamCore.m
+
+      - name: Apply fix2.patch (idempotent)
+        run: |
+          set -e
+          if grep -qF 'media file changed' VcamFix.m; then
+            echo ">> fix2.patch 已应用，跳过"
+          else
+            echo ">> 应用 fix2.patch"
+            patch -p1 --forward < fix2.patch
+          fi
+          echo "---- VcamFix.m VcamFix_PathCheck 现状 ----"
+          grep -n "media file changed" VcamFix.m || true
 
       - name: Build
         run: |
