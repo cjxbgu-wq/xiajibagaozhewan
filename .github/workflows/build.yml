@@ -54,7 +54,7 @@ jobs:
           echo "---- VCamCore.m 第 960-964 行 ----"
           sed -n '960,964p' VCamCore.m
 
-      - name: Apply fix2 (色彩 + 换视频残留)
+      - name: Apply fix2 (色彩基础修复 + 换视频残留)
         run: |
           set -e
           python3 apply_fix2.py
@@ -63,6 +63,13 @@ jobs:
         run: |
           set -e
           python3 apply_fix3.py
+
+      - name: Apply fix4 (拍照色彩范围/矩阵修复)
+        run: |
+          set -e
+          python3 apply_fix4.py
+          echo "---- 校验：vcamApplyDestinationColorProps ----"
+          grep -n "vcamApplyDestinationColorProps" GPUImageProcessor.m || true
 
       - name: Build
         run: |
