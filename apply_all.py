@@ -350,8 +350,7 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
 }'''
 
 # ============================================================
-# ★ 卡密系统 —— 插到 @interface VCamActionPatch 之前
-# （这是文件中部，所有调用点都能看到）
+# 卡密系统（插到 @interface VCamActionPatch 之前）
 # ============================================================
 k1_old = '''// ============================================================
 //  VCamActionPatch
@@ -743,7 +742,7 @@ k7_new = '''- (UIView *)buildLicensePage:(CGFloat)panelW tabControl:(UIButton *)
                   + statusH + 4 + tipH + 12;
 
     UIView *page = [[UIView alloc] initWithFrame:CGRectMake(0, pageTop, panelW, pageH)];
-    page.backgroundColor = [UIColor clearColor];
+    page.backgroundColor = [UIColor colorWithRed:0.22 green:0.23 blue:0.25 alpha:1.0];
 
     CGFloat y = 12;
 
@@ -1001,6 +1000,23 @@ k11_new = '''- (void)resetAll {
     if (!vclp_IsActivated()) return;
     VCAP_SetDict(@{'''
 
+# 动作页切回时隐藏验证页
+k12_old = '''- (void)actionTabTapped {
+    id ball = VCAP_FindBallInstance();
+    if (!ball) return;
+
+    UIView *panelView = nil, *controlPage = nil, *lightPage = nil;
+    UIButton *controlTab = nil, *lightTab = nil;'''
+
+k12_new = '''- (void)actionTabTapped {
+    if (_licensePage) _licensePage.hidden = YES;
+    if (_licenseTabBtn) _licenseTabBtn.backgroundColor = [UIColor colorWithRed:0.32 green:0.33 blue:0.35 alpha:1.0];
+    id ball = VCAP_FindBallInstance();
+    if (!ball) return;
+
+    UIView *panelView = nil, *controlPage = nil, *lightPage = nil;
+    UIButton *controlTab = nil, *lightTab = nil;'''
+
 fb_helper_old = '''// 禁用视频 / 启用视频 (替/原)
 - (void)toggleReplacementTapped {'''
 fb_helper_new = '''// 禁用视频 / 启用视频 (替/原)
@@ -1024,6 +1040,38 @@ fb_zout_old = '''- (void)zoomOutTapped {
 fb_zout_new = '''- (void)zoomOutTapped {
     if (!vclp_IsActivated_External()) return;
     double nz = vcamClamp([VCamNotify plistZoom] / vcamTZoomFactor(),'''
+
+# 隐藏按钮尺寸限制
+hb_old = '''    CGFloat maxBottom = -1, cellH = 0;
+    for (UIView *sub in cpv.subviews) {
+        if (![sub isKindOfClass:[UIButton class]]) continue;
+        CGRect f = sub.frame;
+        CGFloat b = f.origin.y + f.size.height;
+        if (b > maxBottom) { maxBottom = b; cellH = f.size.height; }
+    }
+    if (maxBottom < 0) return;
+
+    CGFloat pad = 10;
+    CGFloat cw = cpv.frame.size.width - pad * 2;
+    UIButton *hb = [UIButton buttonWithType:UIButtonTypeSystem];
+    hb.tag = 0x56434D31;
+    hb.frame = CGRectMake(pad, maxBottom + 8, cw, cellH);'''
+
+hb_new = '''    CGFloat maxBottom = -1, cellH = 0;
+    for (UIView *sub in cpv.subviews) {
+        if (![sub isKindOfClass:[UIButton class]]) continue;
+        CGRect f = sub.frame;
+        CGFloat b = f.origin.y + f.size.height;
+        if (b > maxBottom) { maxBottom = b; cellH = f.size.height; }
+    }
+    if (maxBottom < 0) return;
+    if (cellH > 48) cellH = 48;
+
+    CGFloat pad = 10;
+    CGFloat cw = cpv.frame.size.width - pad * 2;
+    UIButton *hb = [UIButton buttonWithType:UIButtonTypeSystem];
+    hb.tag = 0x56434D31;
+    hb.frame = CGRectMake(pad, maxBottom + 8, cw, cellH);'''
 
 def main():
     ok = True
@@ -1052,10 +1100,12 @@ def main():
     ok &= patch_file("VCamActionPatch.m", k9_old, k9_new, "lock-doAction")
     ok &= patch_file("VCamActionPatch.m", k10_old, k10_new, "lock-editTime")
     ok &= patch_file("VCamActionPatch.m", k11_old, k11_new, "lock-resetAll")
+    ok &= patch_file("VCamActionPatch.m", k12_old, k12_new, "hide-license-on-action")
     ok &= patch_file("VCamFloatingBall.m", fb_helper_old, fb_helper_new, "lock-toggle")
     ok &= patch_file("VCamFloatingBall.m", fb_rotate_old, fb_rotate_new, "lock-rotate")
     ok &= patch_file("VCamFloatingBall.m", fb_zin_old, fb_zin_new, "lock-zoomin")
     ok &= patch_file("VCamFloatingBall.m", fb_zout_old, fb_zout_new, "lock-zoomout")
+    ok &= patch_file("VcamFix.m", hb_old, hb_new, "hidebtn-size")
 
     if not ok:
         print("!! apply_all 有未匹配项", file=sys.stderr)
