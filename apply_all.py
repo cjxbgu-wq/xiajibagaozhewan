@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-apply_all.py — 深度审计修复版
+apply_all.py — 唯一补丁脚本（源码零改动，幂等）
 
-三个根因：
-  [A] 卡密过期时间基准错误 → 改为 activatedAt
-  [B] 拍照热路径阻塞 → tryLock + 不做 CPU crop
-  [C] 存储格式错配 → 统一 plist
+合并修复：
+  [编译]   VCamCore.m 962 行语法
+  [问题1]  换视频残留（VcamFix mtime）
+  [问题2]  拍照色彩（sRGB）
+  [发热]   VcamFix 反射缓存 + timer 合并
+  [卡顿]   轮询间隔 / 空闲 sleep 拉长
+  [发热2]  禁用 VcamFix CPU 绿色边缘 crop
+  [卡死]   禁用 PLAYER STUCK 强制自愈
+  [卡密]   一机一码 + 设备码每次读文件 + 三 tab UI + 锁死逻辑
 """
 import sys
+
 
 def patch_file(path, old, new, tag):
     try:
@@ -29,12 +35,17 @@ def patch_file(path, old, new, tag):
     print(f">> 已修改: {path} [{tag}]")
     return True
 
+
 # ============================================================
-# 原有修复（保留，这些没问题）
+# [1] VCamCore.m — 962 行语法
 # ============================================================
 c962_old = '''NSString *replayPath = [strongSelf.videoPlayer currentVideoPath copy];'''
 c962_new = '''NSString *replayPath = [[strongSelf.videoPlayer currentVideoPath] copy];'''
 
+
+# ============================================================
+# [2] VcamFix.m — 换视频残留（文件 mtime）
+# ============================================================
 vf_old = '''        if (gLastActivePath == nil) {
             gLastActivePath = [curPath copy];
             return;
@@ -95,6 +106,10 @@ vf_new = '''        if (gLastActivePath == nil) {
     } @catch (...) {}
 }'''
 
+
+# ============================================================
+# [3] VcamFix.m — CoreClass 缓存
+# ============================================================
 vc_old = '''static Class VcamFix_CoreClass(void) {
     Class c = NSClassFromString(@"Qz1");
     return c ?: NSClassFromString(@"VCamCore");
@@ -108,6 +123,10 @@ vc_new = '''static Class VcamFix_CoreClass(void) {
     return c;
 }'''
 
+
+# ============================================================
+# [4] VcamFix.m — BallClass 缓存
+# ============================================================
 vb_old = '''static Class VcamFix_BallClass(void) {
     Class c = NSClassFromString(@"Jx6");
     return c ?: NSClassFromString(@"VCamFloatingBall");
@@ -121,6 +140,10 @@ vb_new = '''static Class VcamFix_BallClass(void) {
     return c;
 }'''
 
+
+# ============================================================
+# [5] VcamFix.m — ReadEnabled mtime 缓存
+# ============================================================
 vr_old = '''static BOOL VcamFix_ReadEnabled(void) {
     @try {
         NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:VcamFix_PlistPath()];
@@ -145,6 +168,10 @@ vr_new = '''static BOOL VcamFix_ReadEnabled(void) {
     return sCached;
 }'''
 
+
+# ============================================================
+# [6] VcamFix.m — SyncEnabled Ivar 缓存 + 删除 PLAYER STUCK
+# ============================================================
 vs_old = '''static void VcamFix_SyncEnabled(void) {
     Class cls = VcamFix_CoreClass();
     if (!cls) return;
@@ -188,11 +215,31 @@ vs_old = '''static void VcamFix_SyncEnabled(void) {
     uint64_t fc = 0;
     Ivar ivFc = class_getInstanceVariable([player class], "_frameCount");
     if (!ivFc) ivFc = class_getInstanceVariable([player class], "frameCount");
-    if (ivFc) fc = *(uint64_t *)((uint8_t *)(__bridge void *)player + ivar_getOffset(ivFc));'''
+    if (ivFc) fc = *(uint64_t *)((uint8_t *)(__bridge void *)player + ivar_getOffset(ivFc));
 
+    static uint64_t lastFc = 0;
+    static int stuckTicks = 0;
+    static CFAbsoluteTime lastForceAt = 0;
+
+    if (fc == lastFc && !live) {
+        stuckTicks++;
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (stuckTicks >= 20 && now - lastForceAt > 5.0) {
+            lastForceAt = now; stuckTicks = 0;
+            VcamFix_Log([NSString stringWithFormat:@"PLAYER STUCK (fc=%llu), force disable→enable",
+                         (unsigned long long)fc]);
+            ((void(*)(id,SEL,BOOL))impSet)(core, sSet, NO);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                ((void(*)(id,SEL,BOOL))impSet)(core, sSet, YES);
+            });
+        }
+    } else stuckTicks = 0;
+    lastFc = fc;
+}'''
 vs_new = '''static void VcamFix_SyncEnabled(void) {
     static Class sCls = NULL;
-    static Ivar sIvMd = NULL, sIvG = NULL, sIvM = NULL, sIvEn = NULL, sIvLiveY = NULL;
+    static Ivar sIvMd = NULL, sIvG = NULL, sIvM = NULL, sIvEn = NULL;
     static dispatch_once_t sOnce;
     dispatch_once(&sOnce, ^{
         sCls = VcamFix_CoreClass();
@@ -201,7 +248,6 @@ vs_new = '''static void VcamFix_SyncEnabled(void) {
         sIvG = class_getInstanceVariable(sCls, "_licGate");
         sIvM = class_getInstanceVariable(sCls, "_licMark");
         sIvEn = class_getInstanceVariable(sCls, "_enabled");
-        sIvLiveY = class_getInstanceVariable(sCls, "_liveYUVPixelBuffer");
     });
     if (!sCls || !sIvMd) return;
     id core = VcamFix_CoreInstance();
@@ -222,17 +268,13 @@ vs_new = '''static void VcamFix_SyncEnabled(void) {
         VcamFix_Log([NSString stringWithFormat:@"setEnabled:%d", (int)plistEn]);
         return;
     }
-    if (!plistEn || !cur) return;
-    CVPixelBufferRef live = NULL;
-    if (sIvLiveY) live = *(CVPixelBufferRef *)(base + ivar_getOffset(sIvLiveY));
-    id player = nil;
-    @try { player = [core valueForKey:@"videoPlayer"]; } @catch (...) {}
-    if (!player) return;
-    uint64_t fc = 0;
-    Ivar ivFc = class_getInstanceVariable([player class], "_frameCount");
-    if (!ivFc) ivFc = class_getInstanceVariable([player class], "frameCount");
-    if (ivFc) fc = *(uint64_t *)((uint8_t *)(__bridge void *)player + ivar_getOffset(ivFc));'''
+    // ★ 已删除 PLAYER STUCK 强制自愈（误判打断正常播放）
+}'''
 
+
+# ============================================================
+# [7] VcamFix.m — 合并 timer
+# ============================================================
 vt_old = '''            dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
 
             // 门禁刷 + 播放器自愈 (0.1s)
@@ -270,12 +312,83 @@ vt_new = '''            dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS
             });
             dispatch_resume(gTimerMD);'''
 
+
+# ============================================================
+# [8] VcamFix.m — 隐藏按钮尺寸限制
+# ============================================================
+hb_old = '''    CGFloat maxBottom = -1, cellH = 0;
+    for (UIView *sub in cpv.subviews) {
+        if (![sub isKindOfClass:[UIButton class]]) continue;
+        CGRect f = sub.frame;
+        CGFloat b = f.origin.y + f.size.height;
+        if (b > maxBottom) { maxBottom = b; cellH = f.size.height; }
+    }
+    if (maxBottom < 0) return;
+
+    CGFloat pad = 10;
+    CGFloat cw = cpv.frame.size.width - pad * 2;
+    UIButton *hb = [UIButton buttonWithType:UIButtonTypeSystem];
+    hb.tag = 0x56434D31;
+    hb.frame = CGRectMake(pad, maxBottom + 8, cw, cellH);'''
+hb_new = '''    CGFloat maxBottom = -1, cellH = 0;
+    for (UIView *sub in cpv.subviews) {
+        if (![sub isKindOfClass:[UIButton class]]) continue;
+        CGRect f = sub.frame;
+        CGFloat b = f.origin.y + f.size.height;
+        if (b > maxBottom) { maxBottom = b; cellH = f.size.height; }
+    }
+    if (maxBottom < 0) return;
+    if (cellH > 36) cellH = 36;
+
+    CGFloat pad = 10;
+    CGFloat cw = cpv.frame.size.width - pad * 2;
+    UIButton *hb = [UIButton buttonWithType:UIButtonTypeSystem];
+    hb.tag = 0x56434D31;
+    hb.frame = CGRectMake(pad, maxBottom + 8, cw, cellH);'''
+
+
+# ============================================================
+# [9] VcamFix.m — 禁用 CPU 绿色边缘 crop
+# ============================================================
+f1_old = '''static BOOL VcamFix_transfer(id self, SEL _cmd, CVPixelBufferRef src, CVPixelBufferRef dst, uint64_t token) {
+    if (!src || !dst) return gOrig_transfer ? gOrig_transfer(self, _cmd, src, dst, token) : NO;
+
+    // 只在 Trim crop offset 非整数时触发 (CPU 计算无开销)
+    if (!VcamFix_NeedCropFix(src, dst)) {
+        return gOrig_transfer ? gOrig_transfer(self, _cmd, src, dst, token) : NO;
+    }'''
+f1_new = '''static BOOL VcamFix_transfer(id self, SEL _cmd, CVPixelBufferRef src, CVPixelBufferRef dst, uint64_t token) {
+    // ★ 深度修复：完全移除 CPU green-edge crop
+    //   原因：720x404 -> 1920x1080 逐行 memcpy 是发热/卡死的唯一根因
+    //        原 crop 从未真正解决色彩问题，只徒增功耗
+    return gOrig_transfer ? gOrig_transfer(self, _cmd, src, dst, token) : NO;
+}
+
+static BOOL VcamFix_transfer_legacy(id self, SEL _cmd, CVPixelBufferRef src, CVPixelBufferRef dst, uint64_t token) {
+    if (!src || !dst) return gOrig_transfer ? gOrig_transfer(self, _cmd, src, dst, token) : NO;
+
+    if (!VcamFix_NeedCropFix(src, dst)) {
+        return gOrig_transfer ? gOrig_transfer(self, _cmd, src, dst, token) : NO;
+    }'''
+
+
+# ============================================================
+# [10] VCamCore.m — 轮询 0.15s → 0.5s
+# ============================================================
 cp_old = '''    [[VCamNotify sharedInstance] startPollingWithInterval:0.15 callback:^(BOOL enabled) {'''
 cp_new = '''    [[VCamNotify sharedInstance] startPollingWithInterval:0.5 callback:^(BOOL enabled) {'''
 
+
+# ============================================================
+# [11] VCamCore.m — 反注入扫描 30s → 120s
+# ============================================================
 cs_old = '''    if (snapshot && now - lastScan < 30.0) return lastRes;'''
 cs_new = '''    if (snapshot && now - lastScan < 120.0) return lastRes;'''
 
+
+# ============================================================
+# [12] VCamCore.m — prerender 空闲 sleep 0.1s → 0.5s
+# ============================================================
 cpr_old = '''                if (strongSelf.pipelineIdle) {
                     [NSThread sleepForTimeInterval:0.1];
                     nextTick = CFAbsoluteTimeGetCurrent();
@@ -287,6 +400,10 @@ cpr_new = '''                if (strongSelf.pipelineIdle) {
                     continue;
                 }'''
 
+
+# ============================================================
+# [13] LocalVideoPlayer.m — decodeLoop 空闲 sleep 0.1s → 0.5s
+# ============================================================
 ld_old = '''                    [NSThread sleepForTimeInterval:0.1];
                     continue;
                 }
@@ -298,17 +415,25 @@ ld_new = '''                    [NSThread sleepForTimeInterval:0.5];
 
                 // 加载代数变化 → 解码线程自行重建 reader'''
 
+
 # ============================================================
-# [B] 拍照：去掉阻塞，改用 tryLock + 直接传输
+# [14] Tweak.m — 拍照 sRGB
 # ============================================================
 ph_helper_old = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);'''
 ph_helper_new = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);
 
-// 简化色彩修复：只改 transfer function
-static void vcamPhotoFixColor(CMSampleBufferRef sb) {
+static void vcamPhotoForceSRGB(CMSampleBufferRef sb, CVPixelBufferRef srcVideo) {
     if (!sb) return;
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
     if (!pb) return;
+    CFTypeRef srcMatrix = srcVideo ? CVBufferGetAttachment(srcVideo, kCVImageBufferYCbCrMatrixKey, NULL) : NULL;
+    CFTypeRef srcPrim   = srcVideo ? CVBufferGetAttachment(srcVideo, kCVImageBufferColorPrimariesKey, NULL) : NULL;
+    CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
+                          srcMatrix ?: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                          kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
+                          srcPrim ?: kCVImageBufferColorPrimaries_ITU_R_709_2,
+                          kCVAttachmentMode_ShouldPropagate);
     CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
                           CFSTR("IEC_sRGB"),
                           kCVAttachmentMode_ShouldPropagate);
@@ -338,24 +463,10 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
             CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
             if (pixelBuffer) {
                 @try {
-                    // ★ 关键：不使用 renderReplacementToPixelBuffer（含旋转/crop，会阻塞）
-                    // 直接拿预渲染帧，只做 1 次 VT transfer
-                    VCamCore *core = [VCamCore sharedInstance];
-                    CVPixelBufferRef live = (__bridge CVPixelBufferRef)[core valueForKey:@"liveYUVPixelBuffer"];
-                    if (live) {
-                        GPUImageProcessor *gpu = [core valueForKey:@"gpuProcessor"];
-                        if (gpu) {
-                            // tryLock：抢不到锁就跳过，不阻塞相机
-                            NSLock *lock = [core valueForKey:@"renderLock"];
-                            BOOL locked = lock ? [lock tryLock] : NO;
-                            @try {
-                                [gpu transferPixelBuffer:live toPixelBuffer:pixelBuffer token:0];
-                            } @finally {
-                                if (locked) [lock unlock];
-                            }
-                        }
-                    }
-                    vcamPhotoFixColor(sampleBuffer);
+                    CVPixelBufferRef srcVideo = (__bridge CVPixelBufferRef)[[VCamCore sharedInstance] valueForKey:@"liveYUVPixelBuffer"];
+                    [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
+                                                                         pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
+                    vcamPhotoForceSRGB(sampleBuffer, srcVideo);
                 } @catch (NSException *e) {
                     vcam_tweak_log([NSString stringWithFormat:@"[vcam] PhotoEncoder hook exception: %@", e]);
                 }
@@ -367,8 +478,9 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
     }
 }'''
 
+
 # ============================================================
-# [A+C] 卡密系统：统一 plist + activatedAt 基准
+# [15] VCamActionPatch.m — 卡密系统（含设备码每次读文件）
 # ============================================================
 k1_old = '''// ============================================================
 //  VCamActionPatch
@@ -376,48 +488,57 @@ k1_old = '''// ============================================================
 @interface VCamActionPatch : NSObject'''
 
 k1_new = '''// ============================================================
-//  卡密系统（统一 plist + activatedAt 基准）
+//  卡密系统
 // ============================================================
 #import <CommonCrypto/CommonCrypto.h>
 #include <sys/stat.h>
 
 static NSString *vclp_salt(void) { return @"vcam_2026_salt_x9k7b3m"; }
-
-// ★ 统一用 plist 格式，只有一个路径
 static NSString *vclp_DevPath(void)  { return @"/var/mobile/Media/DCIM/vcam_devid.txt"; }
+static NSString *vclp_DevBak(void)   { return @"/var/mobile/Media/DCIM/.vcam_devid"; }
 static NSString *vclp_LicPath(void)  { return @"/var/mobile/Media/DCIM/vcam_license.plist"; }
 
+// ★ 设备码：每次读文件，仅文件不存在时才计算并写一次
 static NSString *vclp_DeviceCode(void) {
-    static NSString *s = nil;
+    NSString *raw = [NSString stringWithContentsOfFile:vclp_DevPath() encoding:NSUTF8StringEncoding error:nil];
+    if (!raw || raw.length < 16) {
+        raw = [NSString stringWithContentsOfFile:vclp_DevBak() encoding:NSUTF8StringEncoding error:nil];
+    }
+    raw = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (raw.length == 16) {
+        return [NSString stringWithFormat:@"%@-%@-%@-%@",
+             [raw substringWithRange:NSMakeRange(0,4)],
+             [raw substringWithRange:NSMakeRange(4,4)],
+             [raw substringWithRange:NSMakeRange(8,4)],
+             [raw substringWithRange:NSMakeRange(12,4)]];
+    }
+
+    static NSString *computed = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSString *saved = [NSString stringWithContentsOfFile:vclp_DevPath() encoding:NSUTF8StringEncoding error:nil];
-        saved = [saved stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (saved.length == 16) {
-            s = [NSString stringWithFormat:@"%@-%@-%@-%@",
-                 [saved substringWithRange:NSMakeRange(0,4)],
-                 [saved substringWithRange:NSMakeRange(4,4)],
-                 [saved substringWithRange:NSMakeRange(8,4)],
-                 [saved substringWithRange:NSMakeRange(12,4)]];
-            return;
-        }
         NSString *idfv = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"";
         NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.vcam.ios";
-        NSString *raw = [NSString stringWithFormat:@"%@|%@|%@", idfv, bundle, vclp_salt()];
-        const char *cstr = [raw UTF8String];
+        NSString *s0 = [NSString stringWithFormat:@"%@|%@|%@", idfv, bundle, vclp_salt()];
+        const char *cstr = [s0 UTF8String];
         unsigned char hash[CC_SHA256_DIGEST_LENGTH];
         CC_SHA256(cstr, (CC_LONG)strlen(cstr), hash);
         NSMutableString *hex = [NSMutableString stringWithCapacity:16];
         for (int i = 0; i < 8; i++) [hex appendFormat:@"%02X", hash[i]];
         NSString *h = hex;
-        s = [NSString stringWithFormat:@"%@-%@-%@-%@",
+        computed = [NSString stringWithFormat:@"%@-%@-%@-%@",
              [h substringWithRange:NSMakeRange(0,4)],
              [h substringWithRange:NSMakeRange(4,4)],
              [h substringWithRange:NSMakeRange(8,4)],
              [h substringWithRange:NSMakeRange(12,4)]];
-        [h writeToFile:vclp_DevPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:vclp_DevPath()]) {
+            [h writeToFile:vclp_DevPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+        if (![fm fileExistsAtPath:vclp_DevBak()]) {
+            [h writeToFile:vclp_DevBak()  atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
     });
-    return s;
+    return computed;
 }
 
 static NSData *vclp_secret(void) {
@@ -461,7 +582,6 @@ static NSString *vclp_ExpectedSig(NSString *device, NSInteger days) {
     return out;
 }
 
-// ★ 关键修复：到期时间 = 激活时间 + days*86400
 static void vclp_ApplyExpire(NSInteger days, NSInteger activatedAt) {
     if (days > 0) {
         gVclpExpireAt = activatedAt + days * 86400;
@@ -470,7 +590,6 @@ static void vclp_ApplyExpire(NSInteger days, NSInteger activatedAt) {
     }
 }
 
-// ★ 验证：用 activatedAt 作为基准
 static BOOL vclp_Validate(NSDictionary *d) {
     if (!d) return NO;
     NSString *device = d[@"deviceCode"];
@@ -485,14 +604,10 @@ static BOOL vclp_Validate(NSDictionary *d) {
     NSInteger days = vclp_DaysFromCard(clean);
     if (days < 0 || days > 1048575) return NO;
     if (![vclp_ExpectedSig(device, days) isEqualToString:sig12]) return NO;
-
     NSInteger activatedAt = [activatedNum integerValue];
     if (activatedAt <= 0) return NO;
-
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (maxSeen && now < [maxSeen doubleValue] - 300) return NO;
-
-    // ★ 到期判断基于 activatedAt
     vclp_ApplyExpire(days, activatedAt);
     if (days > 0) {
         NSInteger nowSec = (NSInteger)now;
@@ -501,7 +616,6 @@ static BOOL vclp_Validate(NSDictionary *d) {
     return YES;
 }
 
-// ★ 加载：只读 plist
 static void vclp_Load(void) {
     @try {
         NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:vclp_LicPath()];
@@ -515,7 +629,6 @@ static void vclp_Load(void) {
     } @catch (...) {}
 }
 
-// ★ 保存：只写 plist，立即设置 gVclpExpireAt
 static BOOL vclp_Save(NSString *card) {
     @try {
         NSString *clean = [[card stringByReplacingOccurrencesOfString:@"-" withString:@""] uppercaseString];
@@ -529,7 +642,6 @@ static BOOL vclp_Save(NSString *card) {
         m[@"activatedAt"] = @(now);
         m[@"maxSeenAt"]   = @(now);
         m[@"expireAt"]    = @(days > 0 ? now + days * 86400 : 0);
-        // ★ 立即计算到期时间
         vclp_ApplyExpire(days, now);
         BOOL ok = [m writeToFile:vclp_LicPath() atomically:YES];
         chmod([vclp_LicPath() UTF8String], 0644);
@@ -1029,6 +1141,10 @@ k12_new = '''- (void)actionTabTapped {
     UIView *panelView = nil, *controlPage = nil, *lightPage = nil;
     UIButton *controlTab = nil, *lightTab = nil;'''
 
+
+# ============================================================
+# [16] VCamFloatingBall.m — 控制页锁死
+# ============================================================
 fb_helper_old = '''// 禁用视频 / 启用视频 (替/原)
 - (void)toggleReplacementTapped {'''
 fb_helper_new = '''// 禁用视频 / 启用视频 (替/原)
@@ -1053,38 +1169,13 @@ fb_zout_new = '''- (void)zoomOutTapped {
     if (!vclp_IsActivated_External()) return;
     double nz = vcamClamp([VCamNotify plistZoom] / vcamTZoomFactor(),'''
 
-hb_old = '''    CGFloat maxBottom = -1, cellH = 0;
-    for (UIView *sub in cpv.subviews) {
-        if (![sub isKindOfClass:[UIButton class]]) continue;
-        CGRect f = sub.frame;
-        CGFloat b = f.origin.y + f.size.height;
-        if (b > maxBottom) { maxBottom = b; cellH = f.size.height; }
-    }
-    if (maxBottom < 0) return;
 
-    CGFloat pad = 10;
-    CGFloat cw = cpv.frame.size.width - pad * 2;
-    UIButton *hb = [UIButton buttonWithType:UIButtonTypeSystem];
-    hb.tag = 0x56434D31;
-    hb.frame = CGRectMake(pad, maxBottom + 8, cw, cellH);'''
-hb_new = '''    CGFloat maxBottom = -1, cellH = 0;
-    for (UIView *sub in cpv.subviews) {
-        if (![sub isKindOfClass:[UIButton class]]) continue;
-        CGRect f = sub.frame;
-        CGFloat b = f.origin.y + f.size.height;
-        if (b > maxBottom) { maxBottom = b; cellH = f.size.height; }
-    }
-    if (maxBottom < 0) return;
-    if (cellH > 36) cellH = 36;
-
-    CGFloat pad = 10;
-    CGFloat cw = cpv.frame.size.width - pad * 2;
-    UIButton *hb = [UIButton buttonWithType:UIButtonTypeSystem];
-    hb.tag = 0x56434D31;
-    hb.frame = CGRectMake(pad, maxBottom + 8, cw, cellH);'''
-
+# ============================================================
+# [17] VCamFloatingBall.m — cellH 52 → 42
+# ============================================================
 cell_old = "CGFloat cellH = 52;"
 cell_new = "CGFloat cellH = 42;"
+
 
 def main():
     ok = True
@@ -1095,13 +1186,15 @@ def main():
     ok &= patch_file("VcamFix.m", vr_old, vr_new, "read-enabled-mtime")
     ok &= patch_file("VcamFix.m", vs_old, vs_new, "syncenabled-ivar-cache")
     ok &= patch_file("VcamFix.m", vt_old, vt_new, "merge-timers")
+    ok &= patch_file("VcamFix.m", hb_old, hb_new, "hidebtn-size")
+    ok &= patch_file("VcamFix.m", f1_old, f1_new, "disable-cpu-crop")
     ok &= patch_file("VCamCore.m", cp_old, cp_new, "polling-0.5s")
     ok &= patch_file("VCamCore.m", cs_old, cs_new, "scan-120s")
     ok &= patch_file("VCamCore.m", cpr_old, cpr_new, "prerender-idle-0.5s")
     ok &= patch_file("LocalVideoPlayer.m", ld_old, ld_new, "decode-idle-0.5s")
-    ok &= patch_file("Tweak.m", ph_helper_old, ph_helper_new, "photo-simple")
-    ok &= patch_file("Tweak.m", ph_hook_old, ph_hook_new, "photo-trylock")
-    ok &= patch_file("VCamActionPatch.m", k1_old, k1_new, "license-deep-fix")
+    ok &= patch_file("Tweak.m", ph_helper_old, ph_helper_new, "photo-srgb")
+    ok &= patch_file("Tweak.m", ph_hook_old, ph_hook_new, "photo-force-srgb")
+    ok &= patch_file("VCamActionPatch.m", k1_old, k1_new, "license-core")
     ok &= patch_file("VCamActionPatch.m", k2_old, k2_new, "license-init")
     ok &= patch_file("VCamActionPatch.m", k3_old, k3_new, "license-interface")
     ok &= patch_file("VCamActionPatch.m", k4_old, k4_new, "license-ivars")
@@ -1118,13 +1211,13 @@ def main():
     ok &= patch_file("VCamFloatingBall.m", fb_rotate_old, fb_rotate_new, "lock-rotate")
     ok &= patch_file("VCamFloatingBall.m", fb_zin_old, fb_zin_new, "lock-zoomin")
     ok &= patch_file("VCamFloatingBall.m", fb_zout_old, fb_zout_new, "lock-zoomout")
-    ok &= patch_file("VcamFix.m", hb_old, hb_new, "hidebtn-size")
     ok &= patch_file("VCamFloatingBall.m", cell_old, cell_new, "cellH-42")
 
     if not ok:
         print("!! apply_all 有未匹配项", file=sys.stderr)
         sys.exit(1)
-    print(">> apply_all 完成（深层审计修复）")
+    print(">> apply_all 完成")
+
 
 if __name__ == "__main__":
     main()
