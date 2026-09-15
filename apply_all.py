@@ -28,7 +28,7 @@ def patch_file(path, old, new, tag):
     return True
 
 # ============================================================
-# 原有修复（保留，不再改动）
+# 原有修复
 # ============================================================
 c962_old = '''NSString *replayPath = [strongSelf.videoPlayer currentVideoPath copy];'''
 c962_new = '''NSString *replayPath = [[strongSelf.videoPlayer currentVideoPath] copy];'''
@@ -297,18 +297,16 @@ ld_new = '''                    [NSThread sleepForTimeInterval:0.5];
                 // 加载代数变化 → 解码线程自行重建 reader'''
 
 # ============================================================
-# ★ 问题 1：拍照色彩 —— sRGB + 范围扩展
+# ★ 拍照色彩（sRGB + 范围扩展）
 # ============================================================
 ph_helper_old = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);'''
 ph_helper_new = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);
 
-// ★ 拍照色彩修复：JPEG 用 sRGB（不是 BT.709）
 static void vcamPhotoForceSRGB(CMSampleBufferRef sb, CVPixelBufferRef srcVideo) {
     if (!sb) return;
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
     if (!pb) return;
 
-    // YCbCr 矩阵 + primaries：优先继承源视频
     CFTypeRef srcMatrix = srcVideo ? CVBufferGetAttachment(srcVideo, kCVImageBufferYCbCrMatrixKey, NULL) : NULL;
     CFTypeRef srcPrim   = srcVideo ? CVBufferGetAttachment(srcVideo, kCVImageBufferColorPrimariesKey, NULL) : NULL;
     CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
@@ -317,12 +315,10 @@ static void vcamPhotoForceSRGB(CMSampleBufferRef sb, CVPixelBufferRef srcVideo) 
     CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
                           srcPrim ?: kCVImageBufferColorPrimaries_ITU_R_709_2,
                           kCVAttachmentMode_ShouldPropagate);
-    // ★ 关键：JPEG 用 sRGB transfer，不是 BT.709
     CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
                           CFSTR("IEC_sRGB"),
                           kCVAttachmentMode_ShouldPropagate);
 
-    // 范围检查：目标/源 range 不一致时，做 CPU 级 Y/CbCr 扩展
     OSType dstFmt = CVPixelBufferGetPixelFormatType(pb);
     BOOL dstIsFull = (dstFmt == '420f' || dstFmt == kCVPixelFormatType_32BGRA);
     BOOL srcIsFull = YES;
@@ -384,7 +380,7 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
             CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
             if (pixelBuffer) {
                 @try {
-                    CVPixelBufferRef srcVideo = (CVPixelBufferRef)[[VCamCore sharedInstance] valueForKey:@"liveYUVPixelBuffer"];
+                    CVPixelBufferRef srcVideo = (__bridge CVPixelBufferRef)[[VCamCore sharedInstance] valueForKey:@"liveYUVPixelBuffer"];
                     [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
                                                                          pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
                     vcamPhotoForceSRGB(sampleBuffer, srcVideo);
@@ -400,7 +396,7 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
 }'''
 
 # ============================================================
-# ★ 问题 2：重启掉激活 —— 设备码持久化 + 4 路径存储
+# ★ 卡密系统（设备码持久化 + Keychain + 4 路径）
 # ============================================================
 k1_old = '''// ============================================================
 //  VCamActionPatch
@@ -421,7 +417,6 @@ static NSString *vclp_LicFile(void)  { return @"/var/mobile/Library/Preferences/
 static NSString *vclp_LicFile2(void) { return @"/var/mobile/Library/Caches/com.vcam.license.plist"; }
 static NSString *vclp_LicFile3(void) { return @"/var/mobile/Media/DCIM/.vcam_lic"; }
 
-// ★ 关键：设备码只算一次，之后从文件读，IDFV 变了也不影响
 static NSString *vclp_DeviceCode(void) {
     static NSString *s = nil;
     static dispatch_once_t once;
@@ -439,7 +434,6 @@ static NSString *vclp_DeviceCode(void) {
                  [saved substringWithRange:NSMakeRange(12,4)]];
             return;
         }
-        // 首次：算 + 持久化
         NSString *idfv = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"";
         NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.vcam.ios";
         NSString *raw = [NSString stringWithFormat:@"%@|%@|%@", idfv, bundle, vclp_salt()];
@@ -575,7 +569,6 @@ static void vclp_Load(void) {
         if (!d) return;
         if (!vclp_Validate(d)) return;
         gVclpActivated = YES;
-        // 刷新 maxSeen 并回写全部路径
         NSMutableDictionary *m = [NSMutableDictionary dictionaryWithDictionary:d];
         NSInteger newMax = MAX((NSInteger)CFAbsoluteTimeGetCurrent(), [m[@"maxSeenAt"] integerValue]);
         m[@"maxSeenAt"] = @(newMax);
@@ -630,7 +623,6 @@ BOOL vclp_IsActivated_External(void) {
     return vclp_IsActivated();
 }
 
-// ★ 启动早期多次重试（文件系统可能未就绪）
 static void vclp_Init(void) {
     vclp_Load();
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1237,7 +1229,7 @@ def main():
     if not ok:
         print("!! apply_all 有未匹配项", file=sys.stderr)
         sys.exit(1)
-    print(">> apply_all 完成（拍照 sRGB + 设备码持久化）")
+    print(">> apply_all 完成（拍照 sRGB + 设备码持久化 + __bridge 修复）")
 
 if __name__ == "__main__":
     main()
