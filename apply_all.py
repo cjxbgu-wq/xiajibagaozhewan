@@ -2,14 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 apply_all.py — 唯一补丁脚本（源码零改动，幂等）
-
-包含：
-  [编译]  VCamCore.m 962 行语法修复
-  [问题1] 换视频残留修复
-  [问题2] 拍照色彩（安全版：只改 3 个色彩键）
-  [发热]  VcamFix 缓存 + timer 合并
-  [卡顿]  轮询间隔 / 空闲 sleep 拉长
-  [卡密]  一机一码 HMAC 验证 + 三 tab UI + 锁死逻辑
 """
 import sys
 
@@ -960,18 +952,34 @@ k7_new = '''- (UIView *)buildLicensePage:(CGFloat)panelW tabControl:(UIButton *)
 
 - (void)actionTabTapped {'''
 
+# ============================================================
+# ★ 修复：k8 现在处理 VCamFloatingBall.m 里的 selectVideoTapped
+# ============================================================
 k8_old = '''- (void)selectVideoTapped {
     if (!NSClassFromString(@"PHPickerViewController")) return;'''
-k8_new = '''- (void)selectVideoTapped {
-    if (!vclp_IsActivated()) {
+k8_new = '''extern BOOL vclp_IsActivated_External(void);
+
+- (void)selectVideoTapped {
+    if (!vclp_IsActivated_External()) {
         UIAlertController *a = [UIAlertController alertControllerWithTitle:@"未激活"
             message:@"请先在「验证」页输入卡密激活" preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"去激活" style:UIAlertActionStyleDefault
             handler:^(UIAlertAction *act) {
-                [[VCamActionPatch shared] licenseTabTapped];
+                Class cls = NSClassFromString(@"VCamActionPatch");
+                if (cls) {
+                    SEL sShared = NSSelectorFromString(@"shared");
+                    SEL sTab = NSSelectorFromString(@"licenseTabTapped");
+                    if ([cls respondsToSelector:sShared]) {
+                        id (*fnShared)(id, SEL) = (id (*)(id, SEL))[cls methodForSelector:sShared];
+                        id patch = fnShared(cls, sShared);
+                        if (patch && [patch respondsToSelector:sTab]) {
+                            ((void(*)(id,SEL))[patch methodForSelector:sTab])(patch, sTab);
+                        }
+                    }
+                }
             }]];
         [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-        UIViewController *root = [self findRootVC];
+        UIViewController *root = self.overlayWindow.rootViewController;
         if (root) [root presentViewController:a animated:YES completion:nil];
         return;
     }
@@ -995,12 +1003,10 @@ k11_new = '''- (void)resetAll {
     if (!vclp_IsActivated()) return;
     VCAP_SetDict(@{'''
 
-# VCamFloatingBall.m 锁死
+# VCamFloatingBall.m 锁死（在 selectVideoTapped 之后插 extern 声明，避免重复声明冲突）
 fb_helper_old = '''// 禁用视频 / 启用视频 (替/原)
 - (void)toggleReplacementTapped {'''
-fb_helper_new = '''extern BOOL vclp_IsActivated_External(void);
-
-// 禁用视频 / 启用视频 (替/原)
+fb_helper_new = '''// 禁用视频 / 启用视频 (替/原)
 - (void)toggleReplacementTapped {
     if (!vclp_IsActivated_External()) return;'''
 
@@ -1045,7 +1051,8 @@ def main():
     ok &= patch_file("VCamActionPatch.m", k5_old2, k5_new2, "tab-license-page")
     ok &= patch_file("VCamActionPatch.m", k6_old, k6_new, "hide-all-pages")
     ok &= patch_file("VCamActionPatch.m", k7_old, k7_new, "license-page-ui")
-    ok &= patch_file("VCamActionPatch.m", k8_old, k8_new, "lock-select-video")
+    # ★ 修复：目标文件改为 VCamFloatingBall.m
+    ok &= patch_file("VCamFloatingBall.m", k8_old, k8_new, "lock-select-video")
     ok &= patch_file("VCamActionPatch.m", k9_old, k9_new, "lock-doAction")
     ok &= patch_file("VCamActionPatch.m", k10_old, k10_new, "lock-editTime")
     ok &= patch_file("VCamActionPatch.m", k11_old, k11_new, "lock-resetAll")
@@ -1058,7 +1065,6 @@ def main():
         print("!! apply_all 有未匹配项", file=sys.stderr)
         sys.exit(1)
     print(">> apply_all 完成")
-
 
 if __name__ == "__main__":
     main()
