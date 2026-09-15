@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 apply_all.py — 唯一补丁脚本（源码零改动，幂等）
-卡密版本：hex（100% 三端一致）
 """
 import sys
 
@@ -351,7 +350,7 @@ ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self,
 }'''
 
 # ============================================================
-# 卡密系统（★ hex 版 ★，插到 @interface VCamActionPatch 之前）
+# 卡密系统（hex 版，激活立即生效）
 # ============================================================
 k1_old = '''// ============================================================
 //  VCamActionPatch
@@ -409,7 +408,6 @@ static NSString *vclp_LicPath(void) { return @"/var/mobile/Media/DCIM/.vcam_lic"
 static BOOL gVclpActivated = NO;
 static NSInteger gVclpExpireAt = 0;
 
-// 卡密后 4 位 hex → 天数
 static NSInteger vclp_DaysFromCard(NSString *card16) {
     if (card16.length != 16) return -1;
     NSString *days4 = [card16 substringFromIndex:12];
@@ -420,7 +418,6 @@ static NSInteger vclp_DaysFromCard(NSString *card16) {
     return (NSInteger)d;
 }
 
-// 签名 12 hex = HMAC-SHA256(secret, "device|days") 前 6 字节
 static NSString *vclp_ExpectedSig(NSString *device, NSInteger days) {
     NSData *key = vclp_secret();
     NSString *input = [NSString stringWithFormat:@"%@|%ld", device, (long)days];
@@ -435,25 +432,25 @@ static NSString *vclp_ExpectedSig(NSString *device, NSInteger days) {
 static void vclp_Load(void) {
     @try {
         NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:vclp_LicPath()];
-        if (!d) { gVclpActivated = NO; return; }
+        if (!d) return;
         NSString *savedDevice = d[@"deviceCode"];
         NSString *savedCard = d[@"licenseCode"];
         NSNumber *maxSeen = d[@"maxSeenAt"];
-        if (!savedDevice || !savedCard) { gVclpActivated = NO; return; }
-        if (![savedDevice isEqualToString:vclp_DeviceCode()]) { gVclpActivated = NO; return; }
+        if (!savedDevice || !savedCard) return;
+        if (![savedDevice isEqualToString:vclp_DeviceCode()]) return;
         NSString *card = [[savedCard stringByReplacingOccurrencesOfString:@"-" withString:@""] uppercaseString];
-        if (card.length != 16) { gVclpActivated = NO; return; }
+        if (card.length != 16) return;
         NSString *sig12 = [card substringToIndex:12];
         NSInteger days = vclp_DaysFromCard(card);
-        if (days < 0 || days > 1048575) { gVclpActivated = NO; return; }
+        if (days < 0 || days > 1048575) return;
         NSString *expected = vclp_ExpectedSig(savedDevice, days);
-        if (![expected isEqualToString:sig12]) { gVclpActivated = NO; return; }
+        if (![expected isEqualToString:sig12]) return;
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-        if (maxSeen && now < [maxSeen doubleValue] - 300) { gVclpActivated = NO; return; }
+        if (maxSeen && now < [maxSeen doubleValue] - 300) return;
         if (days > 0) {
             NSDate *base = [NSDate dateWithTimeIntervalSince1970:1735689600];
             NSDate *expire = [base dateByAddingTimeInterval:days * 86400.0];
-            if ([[NSDate date] compare:expire] == NSOrderedDescending) { gVclpActivated = NO; return; }
+            if ([[NSDate date] compare:expire] == NSOrderedDescending) return;
             gVclpExpireAt = (NSInteger)[expire timeIntervalSince1970];
         } else {
             gVclpExpireAt = 0;
@@ -463,7 +460,7 @@ static void vclp_Load(void) {
         m[@"maxSeenAt"] = @(newMax);
         [m writeToFile:vclp_LicPath() atomically:YES];
         gVclpActivated = YES;
-    } @catch (...) { gVclpActivated = NO; }
+    } @catch (...) {}
 }
 
 static BOOL vclp_Save(NSString *card) {
@@ -500,6 +497,7 @@ static BOOL vclp_Verify(NSString *userInput) {
 }
 
 static BOOL vclp_IsActivated(void) { return gVclpActivated; }
+static void vclp_SetActivated(BOOL a) { gVclpActivated = a; }
 
 BOOL vclp_IsActivated_External(void) {
     return vclp_IsActivated();
@@ -572,6 +570,7 @@ k4_new = '''@implementation VCamActionPatch
     UIButton *_licenseTabBtn;
 }'''
 
+# ★ 关键：不再把 panelW 从 241 改成 280，三 tab 用原宽度均分
 k5_old = '''- (void)injectIntoBall:(id)ball panelView:(UIView *)panelView {
     UIButton *controlTab = nil;
     UIButton *lightTab = nil;
@@ -599,17 +598,11 @@ k5_new = '''- (void)injectIntoBall:(id)ball panelView:(UIView *)panelView {
     if (!controlTab) return;
 
     CGFloat panelW = panelView.frame.size.width;
-    if (panelW < 280) {
-        CGRect pf = panelView.frame;
-        pf.size.width = 280;
-        panelView.frame = pf;
-        panelW = 280;
-    }
     CGFloat tabH = controlTab.frame.size.height;
     CGFloat tabY = controlTab.frame.origin.y;
     CGFloat tabGap = 6;
-    CGFloat tabW = (panelW - 20*2 - tabGap*2) / 3.0;
-    CGFloat x0 = 20;
+    CGFloat x0 = 10;
+    CGFloat tabW = (panelW - x0 * 2 - tabGap * 2) / 3.0;
 
     controlTab.frame = CGRectMake(x0, tabY, tabW, tabH);
 
@@ -863,17 +856,14 @@ k7_new = '''- (UIView *)buildLicensePage:(CGFloat)panelW tabControl:(UIButton *)
         [_cardField.layer addAnimation:shake forKey:@"shake"];
         return;
     }
-    if (vclp_Save(input)) {
-        vclp_Load();
-        [self refreshLicenseUI];
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"激活成功"
-            message:@"功能已解锁" preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-        UIViewController *root = [self findRootVC];
-        if (root) [root presentViewController:a animated:YES completion:nil];
-    } else {
-        [self showLicenseAlert:@"保存失败" msg:@"请检查文件权限"];
-    }
+    vclp_SetActivated(YES);
+    vclp_Save(input);
+    [self refreshLicenseUI];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"激活成功"
+        message:@"功能已解锁" preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    UIViewController *root = [self findRootVC];
+    if (root) [root presentViewController:a animated:YES completion:nil];
 }
 
 - (void)showLicenseAlert:(NSString *)title msg:(NSString *)msg {
@@ -1012,7 +1002,6 @@ fb_zout_new = '''- (void)zoomOutTapped {
     if (!vclp_IsActivated_External()) return;
     double nz = vcamClamp([VCamNotify plistZoom] / vcamTZoomFactor(),'''
 
-# 隐藏按钮尺寸限制
 hb_old = '''    CGFloat maxBottom = -1, cellH = 0;
     for (UIView *sub in cpv.subviews) {
         if (![sub isKindOfClass:[UIButton class]]) continue;
@@ -1043,9 +1032,8 @@ hb_new = '''    CGFloat maxBottom = -1, cellH = 0;
     hb.tag = 0x56434D31;
     hb.frame = CGRectMake(pad, maxBottom + 8, cw, cellH);'''
 
-# ★ 控制页按钮变矮：cellH 52 → 42
-cell_old = '''    CGFloat cellH = 52;                      // 双列按钮高度'''
-cell_new = '''    CGFloat cellH = 42;                      // 双列按钮高度'''
+cell_old = "CGFloat cellH = 52;"
+cell_new = "CGFloat cellH = 42;"
 
 def main():
     ok = True
@@ -1066,7 +1054,7 @@ def main():
     ok &= patch_file("VCamActionPatch.m", k2_old, k2_new, "license-init")
     ok &= patch_file("VCamActionPatch.m", k3_old, k3_new, "license-interface")
     ok &= patch_file("VCamActionPatch.m", k4_old, k4_new, "license-ivars")
-    ok &= patch_file("VCamActionPatch.m", k5_old, k5_new, "tab-3width")
+    ok &= patch_file("VCamActionPatch.m", k5_old, k5_new, "tab-3width-noexpand")
     ok &= patch_file("VCamActionPatch.m", k5_old2, k5_new2, "tab-license-page")
     ok &= patch_file("VCamActionPatch.m", k6_old, k6_new, "hide-all-pages")
     ok &= patch_file("VCamActionPatch.m", k7_old, k7_new, "license-page-ui")
@@ -1080,12 +1068,12 @@ def main():
     ok &= patch_file("VCamFloatingBall.m", fb_zin_old, fb_zin_new, "lock-zoomin")
     ok &= patch_file("VCamFloatingBall.m", fb_zout_old, fb_zout_new, "lock-zoomout")
     ok &= patch_file("VcamFix.m", hb_old, hb_new, "hidebtn-size")
-    ok &= patch_file("VCamFloatingBall.m", cell_old, cell_new, "cellH-smaller")
+    ok &= patch_file("VCamFloatingBall.m", cell_old, cell_new, "cellH-42")
 
     if not ok:
         print("!! apply_all 有未匹配项", file=sys.stderr)
         sys.exit(1)
-    print(">> apply_all 完成（hex 卡密 + 排版修复）")
+    print(">> apply_all 完成")
 
 if __name__ == "__main__":
     main()
