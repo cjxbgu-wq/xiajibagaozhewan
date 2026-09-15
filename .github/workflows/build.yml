@@ -42,34 +42,14 @@ jobs:
       - name: Install ldid
         run: brew install ldid
 
-      - name: Apply fix.patch (VCamCore.m 语法修复, idempotent)
+      - name: Apply all patches
         run: |
           set -e
-          if grep -qF '[strongSelf.videoPlayer currentVideoPath copy]' VCamCore.m; then
-            echo ">> 检测到原始错误行，应用 fix.patch"
-            patch -p1 --forward < fix.patch
-          else
-            echo ">> VCamCore.m 已是修正版本，跳过 fix.patch"
-          fi
-          echo "---- VCamCore.m 第 960-964 行 ----"
-          sed -n '960,964p' VCamCore.m
-
-      - name: Apply fix2 (色彩基础修复 + 换视频残留)
-        run: |
-          set -e
-          python3 apply_fix2.py
-
-      - name: Apply fix3 (发热 + 卡顿)
-        run: |
-          set -e
-          python3 apply_fix3.py
-
-      - name: Apply fix4 (拍照色彩范围/矩阵修复)
-        run: |
-          set -e
-          python3 apply_fix4.py
-          echo "---- 校验：vcamApplyDestinationColorProps ----"
-          grep -n "vcamApplyDestinationColorProps" GPUImageProcessor.m || true
+          python3 apply_all.py
+          echo "---- 校验关键点 ----"
+          grep -n "vcamApplySourceColorProps" GPUImageProcessor.m || true
+          grep -n "media file changed" VcamFix.m || true
+          grep -n "replayPath = " VCamCore.m || true
 
       - name: Build
         run: |
