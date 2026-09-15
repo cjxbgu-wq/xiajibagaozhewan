@@ -3,12 +3,14 @@
 """
 apply_all.py — 唯一补丁脚本（源码零改动，幂等）
 
-包含全部修复：
+包含修复：
   [编译]  VCamCore.m 962 行 Objective-C 语法
   [问题1] 换视频后旧视频残留（VcamFix 文件 mtime 检测）
-  [问题2] 拍照色差（清空相机色彩/HDR 附件，强制 SDR BT.709）
   [发热]  VcamFix 反射缓存 / plist mtime 缓存 / timer 合并
   [卡顿]  轮询间隔、扫描周期、空闲 sleep 拉长
+
+注意：拍照 hook 保持原样（不修改 pixelBuffer / sampleBuffer 附件），
+      之前清空附件导致相机编码器死锁，已回退。
 
 用法：仓库根目录执行
     python3 apply_all.py
@@ -44,7 +46,7 @@ c962_new = '''NSString *replayPath = [[strongSelf.videoPlayer currentVideoPath] 
 
 
 # ============================================================
-# [2] VcamFix.m — 换视频残留修复（mtime/size 检测）
+# [2] VcamFix.m — 换视频残留修复
 # ============================================================
 vf_old = '''        if (gLastActivePath == nil) {
             gLastActivePath = [curPath copy];
@@ -71,7 +73,7 @@ vf_new = '''        if (gLastActivePath == nil) {
             return;
         }
 
-        // \\u2605 文件内容变化检测（路径不变、文件被覆盖的场景）
+        // ★ 文件内容变化检测
         static double sLastMtime = 0;
         static unsigned long long sLastSize = 0;
         static NSString *sWatchedPath = nil;
@@ -359,128 +361,24 @@ ld_new = '''                    [NSThread sleepForTimeInterval:0.5];
                 // 加载代数变化 → 解码线程自行重建 reader'''
 
 
-# ============================================================
-# [12] Tweak.m — 拍照原彩 helper（清空附件 + SDR 709）
-# ============================================================
-ph_helper_old = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);'''
-
-ph_helper_new = '''static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input);
-
-// ★ 拍照原彩核心：清空相机附加的全部色彩/HDR 附件，只留 SDR BT.709
-static void vcamPhotoForceSDR(CMSampleBufferRef sb) {
-    if (!sb) return;
-    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
-    if (!pb) return;
-
-    // 1. 清空 pixelBuffer 上所有附件
-    static CFDictionaryRef sEmpty = NULL;
-    static dispatch_once_t sOnce;
-    dispatch_once(&sOnce, ^{
-        sEmpty = CFDictionaryCreate(kCFAllocatorDefault, NULL, NULL, 0,
-                                    &kCFTypeDictionaryKeyCallBacks,
-                                    &kCFTypeDictionaryValueCallBacks);
-    });
-    if (sEmpty) CVBufferSetAttachments(pb, sEmpty, kCVAttachmentMode_ShouldPropagate);
-
-    // 2. 只设置 SDR BT.709
-    CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
-                          kCVImageBufferYCbCrMatrix_ITU_R_709_2,
-                          kCVAttachmentMode_ShouldPropagate);
-    CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
-                          kCVImageBufferColorPrimaries_ITU_R_709_2,
-                          kCVAttachmentMode_ShouldPropagate);
-    CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
-                          kCVImageBufferTransferFunction_ITU_R_709_2,
-                          kCVAttachmentMode_ShouldPropagate);
-
-    // 3. 清空 sampleBuffer 的 sample attachments
-    CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, true);
-    if (atts && CFArrayGetCount(atts) > 0) {
-        for (CFIndex i = 0; i < CFArrayGetCount(atts); i++) {
-            CFMutableDictionaryRef d = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(atts, i);
-            if (d) CFDictionaryRemoveAllValues(d);
-        }
-    }
-}'''
-
-
-# ============================================================
-# [13] Tweak.m — 拍照 hook 追加 vcamPhotoForceSDR
-# ============================================================
-ph_hook_old = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
-    if (sampleBuffer) {
-        @autoreleasepool {
-            CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-            if (pixelBuffer) {
-                @try {
-                    [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
-                                                                         pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
-                } @catch (NSException *e) {
-                    vcam_tweak_log([NSString stringWithFormat:@"[vcam] PhotoEncoder hook exception: %@", e]);
-                }
-            }
-        }
-    }
-    if (orig_BWPhotoEncoderNode_renderSampleBuffer) {
-        orig_BWPhotoEncoderNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
-    }
-}'''
-
-ph_hook_new = '''static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
-    if (sampleBuffer) {
-        @autoreleasepool {
-            CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-            if (pixelBuffer) {
-                @try {
-                    [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
-                                                                         pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
-                    vcamPhotoForceSDR(sampleBuffer);
-                    static int sLog = 0;
-                    if ((++sLog % 30) == 1) {
-                        vcam_tweak_log([NSString stringWithFormat:
-                            @"[vcam] photo forced SDR709 (log#%d) %zux%zu fmt=0x%x",
-                            sLog,
-                            CVPixelBufferGetWidth(pixelBuffer),
-                            CVPixelBufferGetHeight(pixelBuffer),
-                            (unsigned)CVPixelBufferGetPixelFormatType(pixelBuffer)]);
-                    }
-                } @catch (NSException *e) {
-                    vcam_tweak_log([NSString stringWithFormat:@"[vcam] PhotoEncoder hook exception: %@", e]);
-                }
-            }
-        }
-    }
-    if (orig_BWPhotoEncoderNode_renderSampleBuffer) {
-        orig_BWPhotoEncoderNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
-    }
-}'''
-
-
 def main():
     ok = True
-    # 编译修复
     ok &= patch_file("VCamCore.m", c962_old, c962_new, "c962-syntax")
-    # 问题1：换视频残留
     ok &= patch_file("VcamFix.m", vf_old, vf_new, "path-mtime")
-    # 发热：VcamFix 缓存 + timer 合并
     ok &= patch_file("VcamFix.m", vc_old, vc_new, "cache-core-class")
     ok &= patch_file("VcamFix.m", vb_old, vb_new, "cache-ball-class")
     ok &= patch_file("VcamFix.m", vr_old, vr_new, "read-enabled-mtime")
     ok &= patch_file("VcamFix.m", vs_old, vs_new, "syncenabled-ivar-cache")
     ok &= patch_file("VcamFix.m", vt_old, vt_new, "merge-timers")
-    # 发热/卡顿：VCamCore + LocalVideoPlayer
     ok &= patch_file("VCamCore.m", cp_old, cp_new, "polling-0.5s")
     ok &= patch_file("VCamCore.m", cs_old, cs_new, "scan-120s")
     ok &= patch_file("VCamCore.m", cpr_old, cpr_new, "prerender-idle-0.5s")
     ok &= patch_file("LocalVideoPlayer.m", ld_old, ld_new, "decode-idle-0.5s")
-    # 拍照原彩：先插 helper，再改 hook
-    ok &= patch_file("Tweak.m", ph_helper_old, ph_helper_new, "photo-sdr-helper")
-    ok &= patch_file("Tweak.m", ph_hook_old, ph_hook_new, "photo-force-sdr")
 
     if not ok:
         print("!! apply_all 有未匹配项", file=sys.stderr)
         sys.exit(1)
-    print(">> apply_all 完成")
+    print(">> apply_all 完成（拍照 hook 保持原样，不再卡死）")
 
 
 if __name__ == "__main__":
