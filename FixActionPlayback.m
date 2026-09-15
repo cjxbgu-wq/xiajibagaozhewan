@@ -1,28 +1,7 @@
 //
-//  FixActionPlayback.m — 动作切片（抢占式三状态机 + 微秒精度）
+//  FixActionPlayback.m — 动作切片（抢占式三状态机 + 微秒精度 + 低延迟优化）
 //
-//  【三状态机】
-//   LOOP_FULL    全片循环 (默认)
-//   PLAY_ACTION  单次播放动作段
-//   FROZEN       冻结在动作段末帧
-//
-//  【抢占式】
-//   点任意动作键 → 直接跳 PLAY_ACTION (无需先退出)
-//   播完 → FROZEN
-//   点"退出动作"按钮 → 回 LOOP_FULL
-//   LOOP_FULL 下点"播" = 暂停/继续 (不进动作模式)
-//
-//  【微秒精度】
-//   plist 存 int64_t 微秒 (action*StartUs / action*EndUs)
-//   CMTimeMake(us, 1000000) → 精度 1μs
-//   兼容旧秒键 (action*Start × 1000000)
-//
-//  【性能优化】
-//   · seek 300ms 防抖 + 异步队列
-//   · prefetch 5 帧 → 1 帧 (hook readNextFrame)
-//   · poller 1.0s + mtime 缓存
-//   · OVERRIDE 日志 30s 限流
-//   · notify 事件驱动 (零延迟响应)
+//  2026-09-15 延迟优化: 防抖 300ms→50ms, 异步 50ms→5ms, poller 1.0s→0.2s
 //
 
 #import <Foundation/Foundation.h>
@@ -255,9 +234,6 @@ static BOOL fxIsOurReader(AVAssetReader *r) {
 
 // ============================================================
 //  Prefetch 限制 (1 帧)
-//
-//  LocalVideoPlayer.rebuildReaderOnDecodeThread 内的 prefetch 循环
-//  调用 readNextFrame 5 次。这里让第 2 次起返回 NULL, 循环立即 break。
 // ============================================================
 static __thread BOOL tInPrefetch = NO;
 static __thread int  tPrefetchCalls = 0;
@@ -267,7 +243,7 @@ static CVPixelBufferRef fx_readNextFrame(id self, SEL _cmd) {
     if (tInPrefetch) {
         tPrefetchCalls++;
         if (tPrefetchCalls > 1) {
-            return NULL;  // 第 2 次起返回 NULL, prefetch 循环 break
+            return NULL;
         }
     }
     return orig_readNextFrame ? orig_readNextFrame(self, _cmd) : NULL;
@@ -283,8 +259,7 @@ static void fx_rebuildReader(id self, SEL _cmd) {
 }
 
 // ============================================================
-//  Hook #1: -[AVAssetReader startReading]
-//  仅 PLAY_ACTION 状态下改写 timeRange 为 [gStartUs, gEndUs]
+//  Hook #1: AVAssetReader startReading
 // ============================================================
 static BOOL (*orig_startReading)(id, SEL) = NULL;
 static BOOL fx_startReading(id self, SEL _cmd) {
@@ -326,8 +301,7 @@ static BOOL fx_startReading(id self, SEL _cmd) {
 }
 
 // ============================================================
-//  Hook #2: -[LocalVideoPlayer resetReaderForLoop]
-//  PLAY_ACTION 播完 → 冻结
+//  Hook #2: LocalVideoPlayer resetReaderForLoop
 // ============================================================
 static void (*orig_resetReaderForLoop)(id, SEL) = NULL;
 static void fx_resetReaderForLoop(id self, SEL _cmd) {
@@ -344,7 +318,7 @@ static void fx_resetReaderForLoop(id self, SEL _cmd) {
 }
 
 // ============================================================
-//  取 player（兼容混淆名 Qz1 与未混淆名 VCamCore）
+//  取 player
 // ============================================================
 static id fxPlayer(void) {
     Class c = NSClassFromString(@"Qz1") ?: NSClassFromString(@"VCamCore");
@@ -360,7 +334,7 @@ static id fxPlayer(void) {
 }
 
 // ============================================================
-//  Seek 防抖 + 异步队列
+//  ★ 延迟优化: Seek 防抖 300ms→50ms, 异步 50ms→5ms
 // ============================================================
 static dispatch_queue_t gSeekQueue = NULL;
 static int64_t   gPendingSeekUs = -1;
@@ -371,7 +345,6 @@ static void fxExecSeek(int64_t us, NSString *path) {
     id p = fxPlayer();
     if (!p) return;
 
-    // SEL/IMP 缓存
     static SEL selSetResume = NULL;
     static IMP impSetResume = NULL;
     static SEL selLoad = NULL;
@@ -404,8 +377,8 @@ static void fxSeekUs(int64_t us, NSString *path) {
 
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
 
-    // 同目标 300ms 内合并
-    if (gPendingSeekUs == us && (now - gPendingSeekAt) < 0.3) {
+    // ★ 防抖窗口 300ms → 50ms (眨→嘴快速切换不再被合并吞掉)
+    if (gPendingSeekUs == us && (now - gPendingSeekAt) < 0.05) {
         return;
     }
 
@@ -414,7 +387,8 @@ static void fxSeekUs(int64_t us, NSString *path) {
     gPendingSeekAt = now;
 
     int64_t capturedUs = us;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+    // ★ 异步延迟 50ms → 5ms (几乎即时执行)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.005 * NSEC_PER_SEC)),
                    gSeekQueue, ^{
         @autoreleasepool {
             if (gPendingSeekUs != capturedUs) return;
@@ -506,7 +480,7 @@ static void fxSyncPaused(NSDictionary *pl) {
 }
 
 // ============================================================
-//  状态机主循环 — 双条件检测
+//  状态机主循环
 // ============================================================
 static void fxCheck(void) {
     NSDictionary *pl = fxLoadPlist();
@@ -584,11 +558,11 @@ static void fxStartPoller(void) {
     gPoller = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
     if (!gPoller) return;
 
-    // 1.0s 兜底
+    // ★ poller 1.0s → 0.2s (notify 丢失时也能 200ms 内捕获)
     dispatch_source_set_timer(gPoller,
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-        (uint64_t)(1.0 * NSEC_PER_SEC),
-        (uint64_t)(0.2 * NSEC_PER_SEC));
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+        (uint64_t)(0.2 * NSEC_PER_SEC),
+        (uint64_t)(0.05 * NSEC_PER_SEC));
 
     __block int beat = 0;
     dispatch_source_set_event_handler(gPoller, ^{
@@ -603,12 +577,11 @@ static void fxStartPoller(void) {
         }
     });
     dispatch_resume(gPoller);
-    fxLog(@"poller started (1.0s)");
+    fxLog(@"poller started (0.2s)");
 }
 
 // ============================================================
-//  Hook #3: -[LocalVideoPlayer loadVideoAtPath:completion:]
-//  回写 videoDuration
+//  Hook #3: loadVideoAtPath 回写 videoDuration
 // ============================================================
 static void (*orig_loadVideo)(id, SEL, NSString *, id) = NULL;
 static void fx_loadVideo(id self, SEL _cmd, NSString *path, id completion) {
@@ -684,11 +657,9 @@ static void fxInstallSBHooks(void) {
         return;
     }
 
-    // 注册 fx_exitTapped_internal 方法
     SEL sExit = NSSelectorFromString(@"fx_exitTapped_internal");
     class_addMethod(cls, sExit, (IMP)fx_exitTapped, "v@:");
 
-    // hook doAction:
     SEL s2 = NSSelectorFromString(@"doAction:");
     Method m2 = class_getInstanceMethod(cls, s2);
     if (m2) {
@@ -697,7 +668,6 @@ static void fxInstallSBHooks(void) {
         fxLog(@"hook doAction: OK");
     }
 
-    // hook injectIntoBall:panelView:
     SEL s3 = NSSelectorFromString(@"injectIntoBall:panelView:");
     Method m3 = class_getInstanceMethod(cls, s3);
     if (m3) {
@@ -720,7 +690,6 @@ static void fxInstall(void) {
         fxLog(@"log path: %s", fxPickLogPath() ?: "(none)");
 
         if (fxIsMd()) {
-            // ========== mediaserverd ==========
             fxLog(@"role=md");
 
             Class r = [AVAssetReader class];
@@ -749,7 +718,6 @@ static void fxInstall(void) {
                     fxLog(@"hook loadVideoAtPath OK");
                 }
 
-                // rebuildReaderOnDecodeThread (prefetch 1 帧)
                 SEL sRebuild = NSSelectorFromString(@"rebuildReaderOnDecodeThread");
                 Method m4 = class_getInstanceMethod(lp, sRebuild);
                 if (m4) {
@@ -757,7 +725,6 @@ static void fxInstall(void) {
                     method_setImplementation(m4, (IMP)fx_rebuildReader);
                 }
 
-                // readNextFrame (prefetch 限制)
                 SEL sRead = NSSelectorFromString(@"readNextFrame");
                 Method m5 = class_getInstanceMethod(lp, sRead);
                 if (m5) {
@@ -771,7 +738,6 @@ static void fxInstall(void) {
             fxLog(@"===== md install done =====");
 
         } else if (fxIsSb()) {
-            // ========== SpringBoard ==========
             fxLog(@"role=sb");
             fxInstallSBHooks();
             fxLog(@"===== sb install done =====");
